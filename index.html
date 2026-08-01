@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NSN Pokémon Draft — Live Draft Board</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hdr">
+    <div>
+      <div class="eyebrow">NSN Pokémon Draft League</div>
+      <h1>Live Draft Board</h1>
+      <p>Pick order is preset below. Everyone sees updates in real time.</p>
+    </div>
+    <div class="identity">
+      <label for="teamSelect">You are drafting for</label>
+      <select id="teamSelect"></select>
+    </div>
+  </div>
+
+  <div class="status-bar" id="turnStatus"></div>
+
+  <div class="layout">
+    <div class="board" id="board"></div>
+
+    <div class="pool-panel">
+      <div class="pool-head">
+        <input id="search" type="text" placeholder="Search available Pokémon…">
+        <span id="poolCount" class="pool-count"></span>
+      </div>
+      <div class="pool" id="pool"></div>
+    </div>
+  </div>
+
+  <footer>Click a Pokémon to draft it — only enabled when it's your team's turn and you can afford it.</footer>
+</div>
+
+<script src="config.js"></script>
+<script src="pokemon-data.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

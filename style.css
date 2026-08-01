@@ -1,0 +1,137 @@
+@import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root{
+  --bg:#12161f;
+  --panel:#1b2130;
+  --panel-2:#232b3d;
+  --line:rgba(255,255,255,0.08);
+  --ink:#e9ecf3;
+  --ink-dim:#8b93a7;
+  --gold:#e8b923;
+  --gold-dim:#8a6c1c;
+  --danger:#e0555f;
+  --ok:#5fbf87;
+}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;}
+body{
+  background:
+    radial-gradient(1200px 600px at 15% -10%, #1f2740 0%, transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, #241c33 0%, transparent 55%),
+    var(--bg);
+  color:var(--ink);
+  font-family:'IBM Plex Sans', sans-serif;
+  min-height:100vh;
+  padding:22px 18px 60px;
+}
+.wrap{max-width:1200px;margin:0 auto;}
+
+.hdr{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:16px;border-bottom:1px solid var(--line);padding-bottom:16px;}
+.hdr h1{font-family:'Chakra Petch',sans-serif;font-weight:700;font-size:26px;letter-spacing:0.5px;margin:0 0 4px;}
+.eyebrow{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:2px;color:var(--gold);text-transform:uppercase;margin-bottom:6px;}
+.hdr p{margin:0;color:var(--ink-dim);font-size:13px;}
+
+.identity{display:flex;flex-direction:column;gap:5px;}
+.identity label{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--ink-dim);text-transform:uppercase;letter-spacing:1px;}
+.identity select{
+  background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+  border-radius:8px;padding:8px 10px;font-family:'IBM Plex Sans',sans-serif;font-size:13.5px;min-width:200px;
+}
+
+.status-bar{
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:12px 16px;margin-bottom:16px;font-size:14px;
+}
+.status-bar .onclock{font-family:'Chakra Petch',sans-serif;font-weight:600;color:var(--gold);}
+.status-bar .onclock.me{color:var(--ok);}
+.status-bar .done{font-family:'Chakra Petch',sans-serif;font-weight:700;color:var(--ok);font-size:16px;}
+
+.layout{display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start;}
+@media (max-width:900px){ .layout{grid-template-columns:1fr;} }
+
+.board{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+  gap:10px;
+}
+.team-col{
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;
+  transition:border-color .15s ease;
+}
+.team-col.on-turn{border-color:var(--gold);box-shadow:0 0 0 1px rgba(232,185,35,0.2) inset;}
+.team-col-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px;}
+.team-name{font-family:'Chakra Petch',sans-serif;font-weight:600;font-size:13.5px;}
+.team-pts{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--gold);white-space:nowrap;}
+.team-pts.over{color:var(--danger);}
+
+.gauge{height:6px;background:var(--panel-2);border-radius:6px;overflow:hidden;border:1px solid var(--line);margin-bottom:10px;}
+.gauge-fill{height:100%;background:linear-gradient(90deg,#c98f1c,var(--gold));border-radius:6px;}
+
+.team-picks{display:flex;flex-direction:column;gap:3px;}
+.pick-row{
+  display:flex;align-items:center;gap:6px;font-size:12px;
+  background:var(--panel-2);border-radius:5px;padding:4px 6px;
+}
+
+/* sprite boxes: fallback letter always underneath, image fades in on load */
+.sprite-box{
+  position:relative;flex-shrink:0;border-radius:7px;overflow:hidden;
+  background:var(--panel-2);
+  border:1px solid color-mix(in srgb, var(--type-color) 45%, var(--line));
+  display:flex;align-items:center;justify-content:center;
+}
+.sprite-box.xs{width:22px;height:22px;border-radius:5px;}
+.sprite-box.sm{width:44px;height:44px;}
+.sprite-fallback{
+  font-family:'Chakra Petch',sans-serif;font-weight:700;color:var(--type-color);
+  font-size:12px;line-height:1;
+}
+.sprite-box.sm .sprite-fallback{font-size:18px;}
+.sprite-box img{
+  position:absolute;inset:0;width:100%;height:100%;object-fit:contain;
+  padding:2px;opacity:0;transition:opacity .2s ease;background:var(--panel-2);
+}
+.sprite-box img.loaded{opacity:1;}
+.sprite-box.no-art .sprite-fallback{opacity:1;}
+.pick-idx{color:var(--ink-dim);font-family:'JetBrains Mono',monospace;font-size:10.5px;width:14px;}
+.pick-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.pick-cost{font-family:'JetBrains Mono',monospace;color:var(--gold);font-size:11px;}
+.undo-btn{
+  background:transparent;border:none;color:var(--ink-dim);cursor:pointer;font-size:11px;
+  padding:0 2px;line-height:1;
+}
+.undo-btn:hover{color:var(--danger);}
+.empty-slot{font-size:11.5px;color:var(--ink-dim);padding:4px 6px;}
+.empty-slot.dim{opacity:0.35;}
+
+.pool-panel{
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:12px;position:sticky;top:16px;max-height:calc(100vh - 180px);
+  display:flex;flex-direction:column;
+}
+.pool-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;}
+.pool-head input{
+  flex:1;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;
+  padding:8px 10px;color:var(--ink);font-family:'IBM Plex Sans',sans-serif;font-size:13px;
+}
+.pool-count{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--ink-dim);white-space:nowrap;}
+
+.pool{overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-right:4px;}
+.pool-card{
+  background:var(--panel-2);border:1px solid var(--line);border-radius:8px;
+  padding:8px 10px;cursor:pointer;transition:border-color .12s ease, transform .12s ease;
+  display:flex;align-items:center;gap:10px;
+}
+.pool-card:hover{border-color:var(--gold);transform:translateX(2px);}
+.pool-card.disabled{opacity:0.35;cursor:not-allowed;}
+.pool-card.disabled:hover{border-color:var(--line);transform:none;}
+.pool-card-body{flex:1;min-width:0;}
+.pool-card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;gap:6px;}
+.pool-name{font-family:'Chakra Petch',sans-serif;font-weight:600;font-size:13px;}
+.pool-cost{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--gold);}
+.types{display:flex;gap:4px;}
+.type-badge{
+  font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:600;letter-spacing:0.4px;
+  padding:2px 6px;border-radius:4px;color:#12161f;text-transform:uppercase;
+}
+
+footer{margin-top:20px;text-align:center;color:var(--ink-dim);font-size:11.5px;font-family:'JetBrains Mono',monospace;}
