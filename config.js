@@ -7,14 +7,16 @@
 //    Give a team a "budget" if they should NOT start at 100 pts.
 //    Omit "budget" (or set it to 100) for everyone else.
 const TEAMS = [
-  { name: "Team Alpha",   budget: 100 },
-  { name: "Team Bravo",   budget: 100 },
-  { name: "Team Charlie", budget: 100 },
-  { name: "Team Delta",   budget: 100 },
-  { name: "Team Echo",    budget: 100 },
-  { name: "Team Foxtrot", budget: 100 },
-  { name: "Team Golf",    budget: 120 }, // example: this team starts with 120 pts
-  { name: "Team Hotel",   budget: 100 },
+  { name: "Denver Dragonite",   budget: 100 },
+  { name: "Dallas Dugtrio",   budget: 100 },
+  { name: "Tokyo Totodiles", budget: 100 },
+  { name: "Toronto Turtwigs",   budget: 100 },
+  { name: "Atlanta Agumon",    budget: 100 },
+  { name: "Buffalo Bishop", budget: 100 },
+  { name: "Salt Lake City Snivys", budget: 100 },
+  { name: "Lithuania Lugia", budget: 100 },
+  { name: "Ottawa Oshawotts",    budget: 100 }, 
+  { name: "Pittsburgh Piplup",   budget: 100 },
 ];
 
 // 2) HOW MANY ROUNDS = HOW MANY POKEMON PER TEAM
