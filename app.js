@@ -1,4 +1,13 @@
-import { initFirebase, subscribeToPicks, addPick, removePickByKey } from "./firebase-sync.js";
+import {
+  initFirebase,
+  subscribeToPicks,
+  addPick,
+  removePickByKey,
+  subscribeToFinalized,
+  setFinalized,
+  archiveAndClearDraft,
+  subscribeToHistory,
+} from "./firebase-sync.js";
 
 const TYPE_COLORS = {
   Normal: "#A8A878", Fire: "#EE8130", Water: "#6390F0", Electric: "#F7D02C",
@@ -11,6 +20,10 @@ const TYPE_COLORS = {
 let picks = []; // synced from Firebase, oldest -> newest
 let myTeam = localStorage.getItem("draft_my_team") || "";
 let searchTerm = "";
+let finalized = false; // true once someone has confirmed the teams are official
+let finalizedBy = null;
+let history = []; // flat list of picks from past archived drafts in this room
+let suggestionsEnabled = localStorage.getItem("draft_suggestions_enabled") === "1";
 
 const el = (id) => document.getElementById(id);
 
@@ -19,51 +32,61 @@ function typeBadge(t) {
   return `<span class="type-badge" style="background:${TYPE_COLORS[t] || "#888"}">${t}</span>`;
 }
 
-// ---------- Sprite loading (PokeAPI, client-side, cached) ----------
-// Results cache to localStorage so repeat visits don't re-fetch 269 mons.
-const SPRITE_CACHE_KEY = "draft_sprite_cache_v1";
-const spriteCache = JSON.parse(localStorage.getItem(SPRITE_CACHE_KEY) || "{}");
+// ---------- PokeAPI meta loading (sprite + base stats, cached) ----------
+// One fetch per mon gets us both the artwork (for sprites) and base stats
+// (for the strength model) — cached to localStorage so repeat visits and
+// prediction re-renders don't re-fetch up to 269 mons every time.
+const META_CACHE_KEY = "draft_mon_meta_cache_v2";
+const metaCache = JSON.parse(localStorage.getItem(META_CACHE_KEY) || "{}");
 
-function persistSpriteCache() {
-  localStorage.setItem(SPRITE_CACHE_KEY, JSON.stringify(spriteCache));
+function persistMetaCache() {
+  localStorage.setItem(META_CACHE_KEY, JSON.stringify(metaCache));
 }
 
-// Returns a Promise<string|null> — image URL, or null if unavailable
-// (e.g. a Champions-exclusive Mega/form PokeAPI doesn't know about yet).
-async function getSpriteUrl(slug) {
-  if (slug in spriteCache) return spriteCache[slug];
+// Returns a Promise<{spriteUrl, bst}> — bst (base stat total) is null when
+// PokeAPI doesn't recognize the slug (e.g. a Champions-exclusive Mega/form).
+async function getPokemonMeta(slug) {
+  if (slug in metaCache) return metaCache[slug];
   try {
     const res = await fetch(`https://pokeapi.co/api/v2/pokemon/${slug}`);
     if (!res.ok) throw new Error("not found");
     const data = await res.json();
-    const url =
+    const spriteUrl =
       data?.sprites?.other?.["official-artwork"]?.front_default ||
       data?.sprites?.front_default ||
       null;
-    spriteCache[slug] = url;
-    persistSpriteCache();
-    return url;
+    const statsArr = data?.stats || [];
+    const bst = statsArr.length ? statsArr.reduce((sum, s) => sum + (s.base_stat || 0), 0) : null;
+    const meta = { spriteUrl, bst };
+    metaCache[slug] = meta;
+    persistMetaCache();
+    return meta;
   } catch {
-    spriteCache[slug] = null;
-    persistSpriteCache();
-    return null;
+    const meta = { spriteUrl: null, bst: null };
+    metaCache[slug] = meta;
+    persistMetaCache();
+    return meta;
   }
 }
 
-// After cards are in the DOM, fill in every [data-slug] image lazily.
+// After cards are in the DOM, fill in every [data-slug] image lazily, and
+// nudge the predictions panel to redraw with sharper data as base stats
+// stream in (a no-op if the draft isn't finalized yet).
 function hydrateSprites(container) {
   const imgs = container.querySelectorAll("img[data-slug]");
   imgs.forEach(async (img) => {
     const slug = img.dataset.slug;
-    const url = await getSpriteUrl(slug);
-    if (url) {
-      img.src = url;
+    const meta = await getPokemonMeta(slug);
+    if (meta.spriteUrl) {
+      img.src = meta.spriteUrl;
       img.classList.add("loaded");
     } else {
       img.closest(".sprite-box")?.classList.add("no-art");
     }
+    if (finalized) renderPredictions();
   });
 }
+
 
 function spriteBox(mon, size = "sm") {
   const initial = mon.name.replace(/^Mega |Hisuian |Alolan |Galarian /, "").charAt(0);
@@ -150,7 +173,7 @@ function renderBoard() {
               ${mon ? spriteBox(mon, "xs") : ""}
               <span class="pick-name">${p.pokemon}</span>
               <span class="pick-cost">${p.cost}</span>
-              <button class="undo-btn" title="Undo this pick" data-key="${p.key}">✕</button>
+              ${finalized ? "" : `<button class="undo-btn" title="Undo this pick" data-key="${p.key}">✕</button>`}
             </div>`;
             })
             .join("") || `<div class="empty-slot">No picks yet</div>`}
@@ -210,16 +233,356 @@ function renderPool() {
   hydrateSprites(el("pool"));
 }
 
+function renderFinalizeControl() {
+  const bar = el("finalizeBar");
+  if (!bar) return;
+  const draftDone = picks.length >= DRAFT_ORDER.length;
+
+  if (finalized) {
+    bar.innerHTML = `
+      <div class="finalize-status locked">
+        <span>🔒 Teams are finalized${finalizedBy ? ` (confirmed by ${finalizedBy})` : ""} — picks are locked in.</span>
+        <button id="unlockBtn" class="link-btn">Not final? Unlock</button>
+      </div>`;
+    el("unlockBtn").onclick = () => {
+      if (!confirm("Unlock the draft? This re-enables picks/undos and hides the projections until it's confirmed again.")) return;
+      setFinalized(DRAFT_ROOM, false, null);
+    };
+  } else if (draftDone) {
+    bar.innerHTML = `<button id="finalizeBtn" class="finalize-btn">✅ Confirm teams are final &amp; lock in projections</button>`;
+    el("finalizeBtn").onclick = () => {
+      if (!confirm("Lock in the draft as final? Only do this once every team's roster is exactly right — this hides the undo buttons for everyone.")) return;
+      setFinalized(DRAFT_ROOM, true, myTeam || null);
+    };
+  } else {
+    const remaining = DRAFT_ORDER.length - picks.length;
+    bar.innerHTML = `<div class="finalize-status pending">Confirm button unlocks once every team has drafted all ${NUM_ROUNDS} Pokémon (${remaining} pick${remaining === 1 ? "" : "s"} left).</div>`;
+  }
+}
+
+// ---------- Predictions ----------
+// Team "strength" blends three signals:
+//  1) Draft cost spent (an auction price already encodes perceived power)
+//  2) Average base stat total (BST) of the roster, pulled from PokeAPI —
+//     the same call already used for sprites, so no extra requests
+//  3) A small type-coverage bonus for rosters with more unique types,
+//     since narrow teams are easier to wall or sweep
+// Records are simulated across a round-robin schedule sized to NUM_ROUNDS
+// "weeks". If a mon's stats haven't loaded yet (or PokeAPI doesn't know a
+// Champions-exclusive form), that team quietly falls back toward a
+// cost-only estimate until data arrives.
+
+function generateRoundRobinSchedule(teamNames, numWeeks) {
+  const hasBye = teamNames.length % 2 !== 0;
+  const arr = hasBye ? [...teamNames, "__BYE__"] : [...teamNames];
+  const n = arr.length;
+  const rounds = [];
+  const rotating = arr.slice();
+
+  for (let r = 0; r < n - 1; r++) {
+    const week = [];
+    for (let i = 0; i < n / 2; i++) {
+      const a = rotating[i];
+      const b = rotating[n - 1 - i];
+      if (a !== "__BYE__" && b !== "__BYE__") week.push([a, b]);
+    }
+    rounds.push(week);
+    const fixed = rotating[0];
+    const rest = rotating.slice(1);
+    rest.unshift(rest.pop());
+    rotating.splice(0, rotating.length, fixed, ...rest);
+  }
+
+  // Cycle through the unique rounds until we've filled every week.
+  const schedule = [];
+  for (let w = 0; w < numWeeks; w++) schedule.push(rounds[w % rounds.length]);
+  return schedule;
+}
+
+// Logistic win probability from a strength gap. k controls how sharply
+// power gaps translate into win odds.
+function winProbability(strengthA, strengthB, k = 20) {
+  return 1 / (1 + Math.exp(-(strengthA - strengthB) / k));
+}
+
+// Computes one team's power score plus the raw ingredients (for display).
+function computeTeamPower(teamName) {
+  const teamPicks = picksByTeam()[teamName] || [];
+  const cost = teamPicks.reduce((sum, p) => sum + p.cost, 0);
+
+  const bstValues = [];
+  const types = new Set();
+  for (const p of teamPicks) {
+    const mon = POKEMON_LIST.find((m) => m.name === p.pokemon);
+    if (!mon) continue;
+    if (mon.type1) types.add(mon.type1);
+    if (mon.type2) types.add(mon.type2);
+    const meta = metaCache[mon.slug];
+    if (meta?.bst != null) bstValues.push(meta.bst);
+  }
+
+  const avgBST = bstValues.length ? bstValues.reduce((a, b) => a + b, 0) / bstValues.length : null;
+  // Scale BST (typically ~300-700) down to roughly the same range as
+  // draft cost (typically ~0-120 for a full roster) so neither signal
+  // dominates just because of units.
+  const bstScore = avgBST != null ? avgBST / 6 : cost;
+  const coverageBonus = types.size * 0.5; // small nudge, not a dominant factor
+
+  const statsCoveragePct = teamPicks.length
+    ? Math.round((bstValues.length / teamPicks.length) * 100)
+    : 0;
+
+  const power = cost * 0.5 + bstScore * 0.5 + coverageBonus;
+  return { power, cost, avgBST, coverage: types.size, statsCoveragePct };
+}
+
+function computePredictions() {
+  const teamNames = TEAMS.map((t) => t.name);
+  const powerByTeam = Object.fromEntries(teamNames.map((n) => [n, computeTeamPower(n)]));
+  const strengthByTeam = Object.fromEntries(teamNames.map((n) => [n, powerByTeam[n].power]));
+  const schedule = generateRoundRobinSchedule(teamNames, NUM_ROUNDS);
+
+  const expectedWins = Object.fromEntries(teamNames.map((n) => [n, 0]));
+  for (const week of schedule) {
+    for (const [a, b] of week) {
+      const pA = winProbability(strengthByTeam[a], strengthByTeam[b]);
+      expectedWins[a] += pA;
+      expectedWins[b] += 1 - pA;
+    }
+  }
+
+  const maxStrength = Math.max(...teamNames.map((n) => strengthByTeam[n]), 1);
+
+  const results = teamNames.map((name) => {
+    const p = powerByTeam[name];
+    const xWins = expectedWins[name];
+    const wins = Math.round(xWins);
+    return {
+      name,
+      strength: Math.round(p.power),
+      strengthPct: Math.round((p.power / maxStrength) * 100),
+      cost: p.cost,
+      avgBST: p.avgBST != null ? Math.round(p.avgBST) : null,
+      coverage: p.coverage,
+      statsCoveragePct: p.statsCoveragePct,
+      expectedWins: xWins,
+      record: `${wins}-${NUM_ROUNDS - wins}`,
+    };
+  });
+
+  results.sort((a, b) => b.expectedWins - a.expectedWins || b.strength - a.strength);
+  results.forEach((r, i) => (r.rank = i + 1));
+  return results;
+}
+
+function renderPredictions() {
+  const container = el("predictions");
+  if (!container) return;
+
+  if (!finalized) {
+    container.classList.remove("show");
+    container.innerHTML = "";
+    return;
+  }
+
+  const results = computePredictions();
+  const champ = results[0];
+  const stillLoading = results.some((r) => r.statsCoveragePct < 100);
+  container.classList.add("show");
+  container.innerHTML = `
+    <div class="predictions-head">
+      <div class="eyebrow">Season Projection</div>
+      <h2>Projected Standings &amp; Champion</h2>
+      <p>Strength blends draft cost spent, each roster's average base stat total (live from PokeAPI), and a small bonus for type coverage. Simulated across a ${NUM_ROUNDS}-week round-robin. For fun — not an official schedule.</p>
+      ${stillLoading ? `<p class="stats-loading-note">🔄 Still pulling live base stats for some Pokémon — this refines automatically as they load.</p>` : ""}
+    </div>
+    <div class="champion-card">
+      <span class="crown">👑</span>
+      <div>
+        <div class="champion-label">Projected Champion</div>
+        <div class="champion-name">${champ.name}</div>
+      </div>
+    </div>
+    <div class="predictions-table">
+      <div class="pred-row pred-row-head">
+        <span class="pred-rank"></span>
+        <span class="pred-team">Team</span>
+        <span class="pred-sub">Avg BST</span>
+        <span class="pred-sub">Types</span>
+        <div class="pred-bar"></div>
+        <span class="pred-strength">Power</span>
+        <span class="pred-record">Record</span>
+      </div>
+      ${results
+        .map(
+          (r) => `
+        <div class="pred-row ${r.rank === 1 ? "champ" : ""}">
+          <span class="pred-rank">#${r.rank}</span>
+          <span class="pred-team">${r.name}</span>
+          <span class="pred-sub">${r.avgBST != null ? r.avgBST : "—"}</span>
+          <span class="pred-sub">${r.coverage}</span>
+          <div class="pred-bar"><div class="pred-bar-fill" style="width:${r.strengthPct}%"></div></div>
+          <span class="pred-strength">${r.strength}</span>
+          <span class="pred-record">${r.record}</span>
+        </div>`
+        )
+        .join("")}
+    </div>
+    <div class="predictions-actions">
+      <button id="exportCsvBtn" class="secondary-btn">⬇️ Export CSV</button>
+      <button id="resetDraftBtn" class="danger-btn">♻️ Reset &amp; start a new draft</button>
+    </div>`;
+
+  el("exportCsvBtn").onclick = exportDraftCSV;
+  el("resetDraftBtn").onclick = () => {
+    if (!confirm("Reset the draft? Results are archived (so future pick suggestions still work), then the board clears for everyone so it can be drafted again.")) return;
+    if (!confirm("Really reset now? This clears every device viewing this room and can't be undone.")) return;
+    archiveAndClearDraft(DRAFT_ROOM);
+  };
+}
+
+// ---------- CSV export ----------
+
+function csvEscape(val) {
+  const s = String(val ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function exportDraftCSV() {
+  const byTeam = picksByTeam();
+  const predictions = computePredictions();
+  const rows = [];
+
+  rows.push(["Team Rosters"]);
+  rows.push(["Team", "Pick #", "Pokemon", "Type 1", "Type 2", "Cost"]);
+  for (const t of TEAMS) {
+    const teamPicks = byTeam[t.name] || [];
+    teamPicks.forEach((p, i) => {
+      const mon = POKEMON_LIST.find((m) => m.name === p.pokemon);
+      rows.push([t.name, i + 1, p.pokemon, mon?.type1 || "", mon?.type2 || "", p.cost]);
+    });
+  }
+
+  rows.push([]);
+  rows.push(["Projections"]);
+  rows.push(["Rank", "Team", "Power Score", "Draft Cost", "Avg Base Stat Total", "Type Coverage", "Projected Record", "Projected Champion"]);
+  predictions.forEach((r) => {
+    rows.push([r.rank, r.name, r.strength, r.cost, r.avgBST ?? "n/a", r.coverage, r.record, r.rank === 1 ? "Yes" : ""]);
+  });
+
+  const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const stamp = new Date().toISOString().slice(0, 10);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${DRAFT_ROOM}-results-${stamp}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ---------- Pick suggestions ----------
+// Looks at every past archived draft in this room for `team` and scores
+// remaining, affordable Pokémon by how often that team has picked each
+// of their types before. Purely a nudge — never blocks a pick.
+
+function typeFrequencyForTeam(team) {
+  const freq = {};
+  for (const h of history) {
+    if (h.team !== team) continue;
+    const mon = POKEMON_LIST.find((m) => m.name === h.pokemon);
+    if (!mon) continue;
+    for (const t of [mon.type1, mon.type2]) {
+      if (!t) continue;
+      freq[t] = (freq[t] || 0) + 1;
+    }
+  }
+  return freq;
+}
+
+function computeSuggestions(team, limit = 4) {
+  const freq = typeFrequencyForTeam(team);
+  const hasHistory = Object.keys(freq).length > 0;
+  if (!hasHistory) return { hasHistory: false, items: [], topTypes: [] };
+
+  const taken = pickedNames();
+  const spent = costsByTeam()[team] || 0;
+  const remaining = (TEAM_BUDGETS[team] ?? 100) - spent;
+
+  const scored = POKEMON_LIST.filter((p) => !taken.has(p.name) && p.cost <= remaining)
+    .map((p) => ({ ...p, score: (freq[p.type1] || 0) + (freq[p.type2] || 0) }))
+    .filter((p) => p.score > 0)
+    .sort((a, b) => b.score - a.score || b.cost - a.cost);
+
+  const topTypes = Object.entries(freq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .map(([t]) => t);
+
+  return { hasHistory: true, items: scored.slice(0, limit), topTypes };
+}
+
+function renderSuggestions() {
+  const box = el("suggestions");
+  if (!box) return;
+
+  const turn = currentTurnTeam();
+  const shouldShow = suggestionsEnabled && myTeam && turn === myTeam && !finalized;
+  if (!shouldShow) {
+    box.classList.remove("show");
+    box.innerHTML = "";
+    return;
+  }
+
+  const { hasHistory, items, topTypes } = computeSuggestions(myTeam);
+  box.classList.add("show");
+
+  if (!hasHistory) {
+    box.innerHTML = `<div class="suggestions-empty">💡 No draft history yet for ${myTeam} — suggestions appear once you've completed at least one past draft in this room.</div>`;
+    return;
+  }
+  if (items.length === 0) {
+    box.innerHTML = `<div class="suggestions-empty">💡 Nothing left in the pool fits ${myTeam}'s usual picks (mostly ${topTypes.join(" & ")}-type) within your remaining budget.</div>`;
+    return;
+  }
+
+  box.innerHTML = `
+    <div class="suggestions-head">💡 Suggested for ${myTeam} — based on past picks (favors ${topTypes.join(" & ")}-type)</div>
+    <div class="suggestions-list">
+      ${items
+        .map(
+          (p) => `
+        <button class="suggestion-chip" data-name="${p.name}">
+          ${spriteBox(p, "xs")}
+          <span class="sugg-name">${p.name}</span>
+          <span class="sugg-cost">${p.cost}</span>
+        </button>`
+        )
+        .join("")}
+    </div>`;
+
+  box.querySelectorAll(".suggestion-chip").forEach((btn) => {
+    btn.onclick = () => draftPokemon(btn.dataset.name);
+  });
+  hydrateSprites(box);
+}
+
 function renderAll() {
   renderStatus();
+  renderFinalizeControl();
   renderBoard();
+  renderSuggestions();
   renderPool();
+  renderPredictions();
   hydrateSprites(el("board"));
 }
 
 // ---------- Actions ----------
 
 function draftPokemon(name) {
+  if (finalized) return;
   const turn = currentTurnTeam();
   if (turn !== myTeam) {
     alert(`It's not your turn — ${turn} is on the clock.`);
@@ -253,9 +616,25 @@ function init() {
     renderPool();
   });
 
+  el("suggestToggle").checked = suggestionsEnabled;
+  el("suggestToggle").addEventListener("change", (e) => {
+    suggestionsEnabled = e.target.checked;
+    localStorage.setItem("draft_suggestions_enabled", suggestionsEnabled ? "1" : "0");
+    renderAll();
+  });
+
   initFirebase(FIREBASE_CONFIG, DRAFT_ROOM);
   subscribeToPicks((newPicks) => {
     picks = newPicks;
+    renderAll();
+  });
+  subscribeToFinalized(DRAFT_ROOM, (data) => {
+    finalized = !!data?.done;
+    finalizedBy = data?.by || null;
+    renderAll();
+  });
+  subscribeToHistory(DRAFT_ROOM, (flatPicks) => {
+    history = flatPicks;
     renderAll();
   });
 }

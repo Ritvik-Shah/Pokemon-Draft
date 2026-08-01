@@ -22,6 +22,7 @@
   </div>
 
   <div class="status-bar" id="turnStatus"></div>
+  <div class="finalize-bar" id="finalizeBar"></div>
 
   <div class="layout">
     <div class="board" id="board"></div>
@@ -31,9 +32,16 @@
         <input id="search" type="text" placeholder="Search available Pokémon…">
         <span id="poolCount" class="pool-count"></span>
       </div>
+      <label class="suggest-toggle">
+        <input type="checkbox" id="suggestToggle">
+        💡 Suggest picks based on my past drafts
+      </label>
+      <div class="suggestions" id="suggestions"></div>
       <div class="pool" id="pool"></div>
     </div>
   </div>
+
+  <div class="predictions" id="predictions"></div>
 
   <footer>Click a Pokémon to draft it — only enabled when it's your team's turn and you can afford it.</footer>
 </div>
