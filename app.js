@@ -32,51 +32,61 @@ function typeBadge(t) {
   return `<span class="type-badge" style="background:${TYPE_COLORS[t] || "#888"}">${t}</span>`;
 }
 
-// ---------- Sprite loading (PokeAPI, client-side, cached) ----------
-// Results cache to localStorage so repeat visits don't re-fetch 269 mons.
-const SPRITE_CACHE_KEY = "draft_sprite_cache_v1";
-const spriteCache = JSON.parse(localStorage.getItem(SPRITE_CACHE_KEY) || "{}");
+// ---------- PokeAPI meta loading (sprite + base stats, cached) ----------
+// One fetch per mon gets us both the artwork (for sprites) and base stats
+// (for the strength model) — cached to localStorage so repeat visits and
+// prediction re-renders don't re-fetch up to 269 mons every time.
+const META_CACHE_KEY = "draft_mon_meta_cache_v2";
+const metaCache = JSON.parse(localStorage.getItem(META_CACHE_KEY) || "{}");
 
-function persistSpriteCache() {
-  localStorage.setItem(SPRITE_CACHE_KEY, JSON.stringify(spriteCache));
+function persistMetaCache() {
+  localStorage.setItem(META_CACHE_KEY, JSON.stringify(metaCache));
 }
 
-// Returns a Promise<string|null> — image URL, or null if unavailable
-// (e.g. a Champions-exclusive Mega/form PokeAPI doesn't know about yet).
-async function getSpriteUrl(slug) {
-  if (slug in spriteCache) return spriteCache[slug];
+// Returns a Promise<{spriteUrl, bst}> — bst (base stat total) is null when
+// PokeAPI doesn't recognize the slug (e.g. a Champions-exclusive Mega/form).
+async function getPokemonMeta(slug) {
+  if (slug in metaCache) return metaCache[slug];
   try {
     const res = await fetch(`https://pokeapi.co/api/v2/pokemon/${slug}`);
     if (!res.ok) throw new Error("not found");
     const data = await res.json();
-    const url =
+    const spriteUrl =
       data?.sprites?.other?.["official-artwork"]?.front_default ||
       data?.sprites?.front_default ||
       null;
-    spriteCache[slug] = url;
-    persistSpriteCache();
-    return url;
+    const statsArr = data?.stats || [];
+    const bst = statsArr.length ? statsArr.reduce((sum, s) => sum + (s.base_stat || 0), 0) : null;
+    const meta = { spriteUrl, bst };
+    metaCache[slug] = meta;
+    persistMetaCache();
+    return meta;
   } catch {
-    spriteCache[slug] = null;
-    persistSpriteCache();
-    return null;
+    const meta = { spriteUrl: null, bst: null };
+    metaCache[slug] = meta;
+    persistMetaCache();
+    return meta;
   }
 }
 
-// After cards are in the DOM, fill in every [data-slug] image lazily.
+// After cards are in the DOM, fill in every [data-slug] image lazily, and
+// nudge the predictions panel to redraw with sharper data as base stats
+// stream in (a no-op if the draft isn't finalized yet).
 function hydrateSprites(container) {
   const imgs = container.querySelectorAll("img[data-slug]");
   imgs.forEach(async (img) => {
     const slug = img.dataset.slug;
-    const url = await getSpriteUrl(slug);
-    if (url) {
-      img.src = url;
+    const meta = await getPokemonMeta(slug);
+    if (meta.spriteUrl) {
+      img.src = meta.spriteUrl;
       img.classList.add("loaded");
     } else {
       img.closest(".sprite-box")?.classList.add("no-art");
     }
+    if (finalized) renderPredictions();
   });
 }
+
 
 function spriteBox(mon, size = "sm") {
   const initial = mon.name.replace(/^Mega |Hisuian |Alolan |Galarian /, "").charAt(0);
@@ -251,10 +261,16 @@ function renderFinalizeControl() {
 }
 
 // ---------- Predictions ----------
-// Team "strength" is the total point value they spent drafting — in an
-// auction draft, cost is already a proxy for competitive power, so no
-// extra data source is needed. Records are simulated across a
-// round-robin schedule sized to NUM_ROUNDS "weeks".
+// Team "strength" blends three signals:
+//  1) Draft cost spent (an auction price already encodes perceived power)
+//  2) Average base stat total (BST) of the roster, pulled from PokeAPI —
+//     the same call already used for sprites, so no extra requests
+//  3) A small type-coverage bonus for rosters with more unique types,
+//     since narrow teams are easier to wall or sweep
+// Records are simulated across a round-robin schedule sized to NUM_ROUNDS
+// "weeks". If a mon's stats haven't loaded yet (or PokeAPI doesn't know a
+// Champions-exclusive form), that team quietly falls back toward a
+// cost-only estimate until data arrives.
 
 function generateRoundRobinSchedule(teamNames, numWeeks) {
   const hasBye = teamNames.length % 2 !== 0;
@@ -284,14 +300,46 @@ function generateRoundRobinSchedule(teamNames, numWeeks) {
 }
 
 // Logistic win probability from a strength gap. k controls how sharply
-// point-value gaps translate into win odds.
+// power gaps translate into win odds.
 function winProbability(strengthA, strengthB, k = 20) {
   return 1 / (1 + Math.exp(-(strengthA - strengthB) / k));
 }
 
+// Computes one team's power score plus the raw ingredients (for display).
+function computeTeamPower(teamName) {
+  const teamPicks = picksByTeam()[teamName] || [];
+  const cost = teamPicks.reduce((sum, p) => sum + p.cost, 0);
+
+  const bstValues = [];
+  const types = new Set();
+  for (const p of teamPicks) {
+    const mon = POKEMON_LIST.find((m) => m.name === p.pokemon);
+    if (!mon) continue;
+    if (mon.type1) types.add(mon.type1);
+    if (mon.type2) types.add(mon.type2);
+    const meta = metaCache[mon.slug];
+    if (meta?.bst != null) bstValues.push(meta.bst);
+  }
+
+  const avgBST = bstValues.length ? bstValues.reduce((a, b) => a + b, 0) / bstValues.length : null;
+  // Scale BST (typically ~300-700) down to roughly the same range as
+  // draft cost (typically ~0-120 for a full roster) so neither signal
+  // dominates just because of units.
+  const bstScore = avgBST != null ? avgBST / 6 : cost;
+  const coverageBonus = types.size * 0.5; // small nudge, not a dominant factor
+
+  const statsCoveragePct = teamPicks.length
+    ? Math.round((bstValues.length / teamPicks.length) * 100)
+    : 0;
+
+  const power = cost * 0.5 + bstScore * 0.5 + coverageBonus;
+  return { power, cost, avgBST, coverage: types.size, statsCoveragePct };
+}
+
 function computePredictions() {
   const teamNames = TEAMS.map((t) => t.name);
-  const strengthByTeam = costsByTeam(); // total pts spent = strength score
+  const powerByTeam = Object.fromEntries(teamNames.map((n) => [n, computeTeamPower(n)]));
+  const strengthByTeam = Object.fromEntries(teamNames.map((n) => [n, powerByTeam[n].power]));
   const schedule = generateRoundRobinSchedule(teamNames, NUM_ROUNDS);
 
   const expectedWins = Object.fromEntries(teamNames.map((n) => [n, 0]));
@@ -306,13 +354,17 @@ function computePredictions() {
   const maxStrength = Math.max(...teamNames.map((n) => strengthByTeam[n]), 1);
 
   const results = teamNames.map((name) => {
-    const strength = strengthByTeam[name];
+    const p = powerByTeam[name];
     const xWins = expectedWins[name];
     const wins = Math.round(xWins);
     return {
       name,
-      strength,
-      strengthPct: Math.round((strength / maxStrength) * 100),
+      strength: Math.round(p.power),
+      strengthPct: Math.round((p.power / maxStrength) * 100),
+      cost: p.cost,
+      avgBST: p.avgBST != null ? Math.round(p.avgBST) : null,
+      coverage: p.coverage,
+      statsCoveragePct: p.statsCoveragePct,
       expectedWins: xWins,
       record: `${wins}-${NUM_ROUNDS - wins}`,
     };
@@ -335,12 +387,14 @@ function renderPredictions() {
 
   const results = computePredictions();
   const champ = results[0];
+  const stillLoading = results.some((r) => r.statsCoveragePct < 100);
   container.classList.add("show");
   container.innerHTML = `
     <div class="predictions-head">
       <div class="eyebrow">Season Projection</div>
       <h2>Projected Standings &amp; Champion</h2>
-      <p>Simulated across a ${NUM_ROUNDS}-week season using each team's total drafted point value as its strength score. For fun — not an official schedule.</p>
+      <p>Strength blends draft cost spent, each roster's average base stat total (live from PokeAPI), and a small bonus for type coverage. Simulated across a ${NUM_ROUNDS}-week round-robin. For fun — not an official schedule.</p>
+      ${stillLoading ? `<p class="stats-loading-note">🔄 Still pulling live base stats for some Pokémon — this refines automatically as they load.</p>` : ""}
     </div>
     <div class="champion-card">
       <span class="crown">👑</span>
@@ -350,14 +404,25 @@ function renderPredictions() {
       </div>
     </div>
     <div class="predictions-table">
+      <div class="pred-row pred-row-head">
+        <span class="pred-rank"></span>
+        <span class="pred-team">Team</span>
+        <span class="pred-sub">Avg BST</span>
+        <span class="pred-sub">Types</span>
+        <div class="pred-bar"></div>
+        <span class="pred-strength">Power</span>
+        <span class="pred-record">Record</span>
+      </div>
       ${results
         .map(
           (r) => `
         <div class="pred-row ${r.rank === 1 ? "champ" : ""}">
           <span class="pred-rank">#${r.rank}</span>
           <span class="pred-team">${r.name}</span>
+          <span class="pred-sub">${r.avgBST != null ? r.avgBST : "—"}</span>
+          <span class="pred-sub">${r.coverage}</span>
           <div class="pred-bar"><div class="pred-bar-fill" style="width:${r.strengthPct}%"></div></div>
-          <span class="pred-strength">${r.strength} pts</span>
+          <span class="pred-strength">${r.strength}</span>
           <span class="pred-record">${r.record}</span>
         </div>`
         )
@@ -400,9 +465,9 @@ function exportDraftCSV() {
 
   rows.push([]);
   rows.push(["Projections"]);
-  rows.push(["Rank", "Team", "Strength (pts)", "Projected Record", "Projected Champion"]);
+  rows.push(["Rank", "Team", "Power Score", "Draft Cost", "Avg Base Stat Total", "Type Coverage", "Projected Record", "Projected Champion"]);
   predictions.forEach((r) => {
-    rows.push([r.rank, r.name, r.strength, r.record, r.rank === 1 ? "Yes" : ""]);
+    rows.push([r.rank, r.name, r.strength, r.cost, r.avgBST ?? "n/a", r.coverage, r.record, r.rank === 1 ? "Yes" : ""]);
   });
 
   const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
