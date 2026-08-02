@@ -168,6 +168,31 @@ function currentRound(list = picks) {
   return n < 0 ? 1 : Math.floor(n / TEAMS.length) + 1;
 }
 
+// Team objects in "on the clock first" order: whoever picks next leads,
+// followed by the actual upcoming turn sequence pulled straight from
+// DRAFT_ORDER — so this automatically follows snake (round order flips)
+// or fixed/custom (it doesn't) without knowing which mode is active.
+// Once real upcoming turns run out (the last few picks of the draft),
+// any teams not yet seen are appended in their original TEAMS order.
+function boardOrderTeams(list) {
+  const order = [];
+  const seen = new Set();
+  for (let i = list.length; i < DRAFT_ORDER.length && order.length < TEAMS.length; i++) {
+    const name = DRAFT_ORDER[i];
+    if (seen.has(name)) continue;
+    seen.add(name);
+    order.push(name);
+  }
+  for (const t of TEAMS) {
+    if (order.length >= TEAMS.length) break;
+    if (!seen.has(t.name)) {
+      seen.add(t.name);
+      order.push(t.name);
+    }
+  }
+  return order.map((name) => TEAMS.find((t) => t.name === name));
+}
+
 // The cheapest Pokémon anywhere in the pool — the minimum a team must be
 // able to reserve for each slot it still has left to fill.
 const MIN_MON_COST = Math.min(...POKEMON_LIST.map((p) => p.cost));
@@ -264,7 +289,7 @@ function renderBoard() {
   const costs = costsByTeam(list);
   const byTeam = picksByTeam(list);
   const turn = activeTurnTeam();
-  el("board").innerHTML = TEAMS.map((t) => {
+  el("board").innerHTML = boardOrderTeams(list).map((t) => {
     const spent = costs[t.name] || 0;
     const budget = TEAM_BUDGETS[t.name];
     const remaining = budget - spent;
