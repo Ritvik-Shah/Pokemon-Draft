@@ -7,6 +7,13 @@ import {
   setFinalized,
   archiveAndClearDraft,
   subscribeToHistory,
+  subscribeToMockPicks,
+  subscribeToMockControllers,
+  subscribeToMockStatus,
+  claimMockTeam,
+  startMockSession,
+  submitMockPick,
+  resetMockDraft,
 } from "./firebase-sync.js";
 
 const TYPE_COLORS = {
@@ -17,6 +24,15 @@ const TYPE_COLORS = {
   Steel: "#B7B7CE", Fairy: "#D685AD",
 };
 
+// Distinct identity colors assigned in draft order — used consistently
+// across the board, standings, and suggestions so each team reads as the
+// same "team" everywhere on the page, not just a gray card with a label.
+const TEAM_COLORS = ["#FF4753", "#C6FF4D", "#4DD8FF", "#C792FF", "#FFB74D", "#FF80B8", "#38E0B4", "#7C93FF"];
+function teamColor(name) {
+  const idx = TEAMS.findIndex((t) => t.name === name);
+  return TEAM_COLORS[idx >= 0 ? idx % TEAM_COLORS.length : 0];
+}
+
 let picks = []; // synced from Firebase, oldest -> newest
 let myTeam = localStorage.getItem("draft_my_team") || "";
 let searchTerm = "";
@@ -24,6 +40,22 @@ let finalized = false; // true once someone has confirmed the teams are official
 let finalizedBy = null;
 let history = []; // flat list of picks from past archived drafts in this room
 let suggestionsEnabled = localStorage.getItem("draft_suggestions_enabled") === "1";
+
+// ---------- Mock draft state ----------
+// A stable id for this browser (not a real account — just enough to know
+// "this tab locked in Team Alpha" across reloads and to arbitrate claims).
+const CLIENT_ID_KEY = "draft_client_id";
+let clientId = localStorage.getItem(CLIENT_ID_KEY);
+if (!clientId) {
+  clientId = `c_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  localStorage.setItem(CLIENT_ID_KEY, clientId);
+}
+let mockMode = localStorage.getItem("draft_mock_mode") === "1";
+let mockMyTeam = localStorage.getItem("draft_mock_team") || "";
+let mockPicks = []; // synced from rooms/{room}/mock/picksList
+let mockControllers = {}; // { TeamName: clientId } — absent/falsy = bot-controlled
+let mockStatus = null; // { active, startedAt } | null
+let mockBotTimer = null;
 
 const el = (id) => document.getElementById(id);
 
@@ -98,33 +130,47 @@ function spriteBox(mon, size = "sm") {
     </div>`;
 }
 
-function pickedNames() {
-  return new Set(picks.map((p) => p.pokemon));
+function pickedNames(list = picks) {
+  return new Set(list.map((p) => p.pokemon));
 }
 
-function costsByTeam() {
+function costsByTeam(list = picks) {
   const out = {};
   for (const t of TEAMS) out[t.name] = 0;
-  for (const p of picks) out[p.team] = (out[p.team] || 0) + p.cost;
+  for (const p of list) out[p.team] = (out[p.team] || 0) + p.cost;
   return out;
 }
 
-function picksByTeam() {
+function picksByTeam(list = picks) {
   const out = {};
   for (const t of TEAMS) out[t.name] = [];
-  for (const p of picks) out[p.team]?.push(p);
+  for (const p of list) out[p.team]?.push(p);
   return out;
 }
 
-function currentTurnTeam() {
-  if (picks.length >= DRAFT_ORDER.length) return null; // draft complete
-  return DRAFT_ORDER[picks.length];
+function currentTurnTeam(list = picks) {
+  if (list.length >= DRAFT_ORDER.length) return null; // draft complete
+  return DRAFT_ORDER[list.length];
 }
 
-function currentRound() {
-  return Math.min(picks.length, DRAFT_ORDER.length - 1) < 0
-    ? 1
-    : Math.floor(Math.min(picks.length, DRAFT_ORDER.length - 1) / TEAMS.length) + 1;
+function currentRound(list = picks) {
+  const n = Math.min(list.length, DRAFT_ORDER.length - 1);
+  return n < 0 ? 1 : Math.floor(n / TEAMS.length) + 1;
+}
+
+// Which dataset/team/turn is "in play" right now — the real draft, or (if
+// mock mode is toggled on) the shared practice draft.
+function activeList() {
+  return mockMode ? mockPicks : picks;
+}
+function activeMyTeam() {
+  return mockMode ? mockMyTeam : myTeam;
+}
+function activeTurnTeam() {
+  return currentTurnTeam(activeList());
+}
+function iAmLockedIn() {
+  return mockMode && !!mockMyTeam && mockControllers[mockMyTeam] === clientId;
 }
 
 // ---------- Rendering ----------
@@ -136,30 +182,52 @@ function renderIdentityBar() {
 }
 
 function renderStatus() {
-  const turn = currentTurnTeam();
   const statusEl = el("turnStatus");
-  if (turn === null) {
-    statusEl.innerHTML = `<span class="done">Draft complete 🎉</span>`;
-  } else {
-    const isMe = turn === myTeam;
-    statusEl.innerHTML = `Pick <b>${picks.length + 1}</b> / ${DRAFT_ORDER.length} · Round <b>${currentRound()}</b> · On the clock: <span class="onclock ${isMe ? "me" : ""}">${turn}</span>${isMe ? " — that's you!" : ""}`;
+
+  if (mockMode && !mockStatus?.active) {
+    statusEl.innerHTML = `<span class="finalize-status pending" style="border:none;background:none;padding:0;">Set up your mock draft below to begin.</span>`;
+    return;
   }
+
+  const list = activeList();
+  const turn = activeTurnTeam();
+
+  if (turn === null) {
+    statusEl.innerHTML = mockMode
+      ? `<span class="done">Mock draft complete! 🎉 Restart below to practice again.</span>`
+      : `<span class="done">Draft complete 🎉</span>`;
+    return;
+  }
+
+  const isMe = turn === activeMyTeam();
+  statusEl.style.setProperty("--team-color", teamColor(turn));
+  const botTag = mockMode && !mockControllers[turn] ? ` <span class="bot-tag">BOT</span>` : "";
+  statusEl.innerHTML = `<span class="live-dot"></span>Pick <b>${list.length + 1}</b> / ${DRAFT_ORDER.length} · Round <b>${currentRound(list)}</b> · On the clock: <span class="onclock ${isMe ? "me" : ""}">${turn}</span>${botTag}${isMe ? " — that's you!" : ""}`;
 }
 
 function renderBoard() {
-  const costs = costsByTeam();
-  const byTeam = picksByTeam();
+  const list = activeList();
+  const costs = costsByTeam(list);
+  const byTeam = picksByTeam(list);
+  const turn = activeTurnTeam();
   el("board").innerHTML = TEAMS.map((t) => {
     const spent = costs[t.name] || 0;
     const budget = TEAM_BUDGETS[t.name];
     const remaining = budget - spent;
     const teamPicks = byTeam[t.name] || [];
-    const isTurn = currentTurnTeam() === t.name;
+    const isTurn = turn === t.name;
     const pct = Math.min(100, (spent / budget) * 100);
+    const tag = !mockMode
+      ? ""
+      : mockControllers[t.name] === clientId
+      ? `<span class="bot-tag you-tag">YOU</span>`
+      : mockControllers[t.name]
+      ? `<span class="bot-tag human-tag">PLAYER</span>`
+      : `<span class="bot-tag">BOT</span>`;
     return `
-      <div class="team-col ${isTurn ? "on-turn" : ""}">
+      <div class="team-col ${isTurn ? "on-turn" : ""}" style="--team-color:${teamColor(t.name)}">
         <div class="team-col-head">
-          <span class="team-name">${t.name}</span>
+          <span class="team-name">${t.name}${tag}</span>
           <span class="team-pts ${remaining < 0 ? "over" : ""}">${remaining} left</span>
         </div>
         <div class="gauge small"><div class="gauge-fill" style="width:${pct}%"></div></div>
@@ -173,7 +241,7 @@ function renderBoard() {
               ${mon ? spriteBox(mon, "xs") : ""}
               <span class="pick-name">${p.pokemon}</span>
               <span class="pick-cost">${p.cost}</span>
-              ${finalized ? "" : `<button class="undo-btn" title="Undo this pick" data-key="${p.key}">✕</button>`}
+              ${!mockMode && !finalized ? `<button class="undo-btn" title="Undo this pick" data-key="${p.key}">✕</button>` : ""}
             </div>`;
             })
             .join("") || `<div class="empty-slot">No picks yet</div>`}
@@ -193,11 +261,14 @@ function renderBoard() {
 }
 
 function renderPool() {
-  const taken = pickedNames();
-  const turn = currentTurnTeam();
-  const spentByMe = costsByTeam()[myTeam] || 0;
-  const myBudget = TEAM_BUDGETS[myTeam] ?? 100;
+  const list = activeList();
+  const team = activeMyTeam();
+  const taken = pickedNames(list);
+  const turn = activeTurnTeam();
+  const spentByMe = costsByTeam(list)[team] || 0;
+  const myBudget = TEAM_BUDGETS[team] ?? 100;
   const myRemaining = myBudget - spentByMe;
+  const canAct = mockMode ? !!(mockStatus?.active && iAmLockedIn()) : true;
 
   const filtered = POKEMON_LIST.filter((p) => {
     if (taken.has(p.name)) return false;
@@ -210,7 +281,7 @@ function renderPool() {
   el("pool").innerHTML = filtered
     .map((p) => {
       const canAfford = p.cost <= myRemaining;
-      const isMyTurn = turn === myTeam && myTeam;
+      const isMyTurn = turn === team && team && canAct;
       const disabled = !isMyTurn || !canAfford;
       return `
       <div class="pool-card ${disabled ? "disabled" : ""}" data-name="${p.name}">
@@ -236,6 +307,10 @@ function renderPool() {
 function renderFinalizeControl() {
   const bar = el("finalizeBar");
   if (!bar) return;
+  if (mockMode) {
+    bar.innerHTML = "";
+    return;
+  }
   const draftDone = picks.length >= DRAFT_ORDER.length;
 
   if (finalized) {
@@ -379,6 +454,12 @@ function renderPredictions() {
   const container = el("predictions");
   if (!container) return;
 
+  if (mockMode) {
+    container.classList.remove("show");
+    container.innerHTML = "";
+    return;
+  }
+
   if (!finalized) {
     container.classList.remove("show");
     container.innerHTML = "";
@@ -483,78 +564,201 @@ function exportDraftCSV() {
   URL.revokeObjectURL(url);
 }
 
-// ---------- Pick suggestions ----------
-// Looks at every past archived draft in this room for `team` and scores
-// remaining, affordable Pokémon by how often that team has picked each
-// of their types before. Purely a nudge — never blocks a pick.
+// ---------- Type effectiveness & classic comps ----------
+// Standard attacker -> defender multiplier chart (only non-1x entries
+// listed). Used to figure out what a team's roster is exposed to and
+// which candidates patch that.
+const TYPE_CHART = {
+  Normal: { Rock: 0.5, Ghost: 0, Steel: 0.5 },
+  Fire: { Fire: 0.5, Water: 0.5, Grass: 2, Ice: 2, Bug: 2, Rock: 0.5, Dragon: 0.5, Steel: 2 },
+  Water: { Fire: 2, Water: 0.5, Grass: 0.5, Ground: 2, Rock: 2, Dragon: 0.5 },
+  Electric: { Water: 2, Electric: 0.5, Grass: 0.5, Ground: 0, Flying: 2, Dragon: 0.5 },
+  Grass: { Fire: 0.5, Water: 2, Grass: 0.5, Poison: 0.5, Ground: 2, Flying: 0.5, Bug: 0.5, Rock: 2, Dragon: 0.5, Steel: 0.5 },
+  Ice: { Fire: 0.5, Water: 0.5, Grass: 2, Ice: 0.5, Ground: 2, Flying: 2, Dragon: 2, Steel: 0.5 },
+  Fighting: { Normal: 2, Ice: 2, Poison: 0.5, Flying: 0.5, Psychic: 0.5, Bug: 0.5, Rock: 2, Ghost: 0, Dark: 2, Steel: 2, Fairy: 0.5 },
+  Poison: { Grass: 2, Poison: 0.5, Ground: 0.5, Rock: 0.5, Ghost: 0.5, Steel: 0, Fairy: 2 },
+  Ground: { Fire: 2, Electric: 2, Grass: 0.5, Poison: 2, Flying: 0, Bug: 0.5, Rock: 2, Steel: 2 },
+  Flying: { Electric: 0.5, Grass: 2, Fighting: 2, Bug: 2, Rock: 0.5, Steel: 0.5 },
+  Psychic: { Fighting: 2, Poison: 2, Psychic: 0.5, Dark: 0, Steel: 0.5 },
+  Bug: { Fire: 0.5, Grass: 2, Fighting: 0.5, Poison: 0.5, Flying: 0.5, Psychic: 2, Ghost: 0.5, Dark: 2, Steel: 0.5, Fairy: 0.5 },
+  Rock: { Fire: 2, Ice: 2, Fighting: 0.5, Ground: 0.5, Flying: 2, Bug: 2, Steel: 0.5 },
+  Ghost: { Normal: 0, Psychic: 2, Ghost: 2, Dark: 0.5 },
+  Dragon: { Dragon: 2, Steel: 0.5, Fairy: 0 },
+  Dark: { Fighting: 0.5, Psychic: 2, Ghost: 2, Dark: 0.5, Fairy: 0.5 },
+  Steel: { Fire: 0.5, Water: 0.5, Electric: 0.5, Ice: 2, Rock: 2, Steel: 0.5, Fairy: 2 },
+  Fairy: { Fire: 0.5, Fighting: 2, Poison: 0.5, Dragon: 2, Dark: 2, Steel: 0.5 },
+};
+const ALL_TYPES = Object.keys(TYPE_CHART);
 
-function typeFrequencyForTeam(team) {
-  const freq = {};
-  for (const h of history) {
-    if (h.team !== team) continue;
-    const mon = POKEMON_LIST.find((m) => m.name === h.pokemon);
-    if (!mon) continue;
-    for (const t of [mon.type1, mon.type2]) {
-      if (!t) continue;
-      freq[t] = (freq[t] || 0) + 1;
-    }
+function effectiveness(attackType, defTypes) {
+  let mult = 1;
+  for (const dt of defTypes) {
+    if (!dt) continue;
+    const m = TYPE_CHART[attackType]?.[dt];
+    mult *= m === undefined ? 1 : m;
   }
-  return freq;
+  return mult;
 }
 
-function computeSuggestions(team, limit = 4) {
-  const freq = typeFrequencyForTeam(team);
-  const hasHistory = Object.keys(freq).length > 0;
-  if (!hasHistory) return { hasHistory: false, items: [], topTypes: [] };
+// Hand-picked classic type pairings that show up again and again in real
+// competitive Pokémon comps — a stand-in for "team composition" synergy
+// since draft data only has types, not full movesets.
+const CORE_SYNERGIES = [
+  ["Water", "Fire"], ["Water", "Grass"], ["Fire", "Grass"],
+  ["Steel", "Fairy"], ["Ground", "Electric"], ["Flying", "Fighting"],
+  ["Water", "Ground"], ["Dragon", "Fairy"], ["Psychic", "Dark"],
+  ["Steel", "Dragon"], ["Fairy", "Dark"], ["Ghost", "Psychic"],
+  ["Rock", "Water"], ["Ice", "Ground"], ["Steel", "Ground"],
+];
+function synergyPartners(type) {
+  const partners = new Set();
+  for (const [a, b] of CORE_SYNERGIES) {
+    if (a === type) partners.add(b);
+    if (b === type) partners.add(a);
+  }
+  return partners;
+}
 
-  const taken = pickedNames();
-  const spent = costsByTeam()[team] || 0;
-  const remaining = (TEAM_BUDGETS[team] ?? 100) - spent;
+// Scores every affordable, undrafted Pokémon for `team` against the given
+// picks list, blending:
+//  - stat efficiency (BST per point spent, live from PokeAPI)
+//  - type-weakness patching (does it cover a hole the roster already has)
+//  - classic type-core synergy (a stand-in for "real comps")
+//  - budget pacing (does the cost fit what's left to spend / slots left)
+// No draft history required — works from a completely empty roster.
+function scoreCandidates(team, picksList) {
+  const roster = picksByTeam(picksList)[team] || [];
+  const spent = costsByTeam(picksList)[team] || 0;
+  const budget = TEAM_BUDGETS[team] ?? 100;
+  const remaining = budget - spent;
+  const slotsLeft = Math.max(1, NUM_ROUNDS - roster.length);
+  const taken = pickedNames(picksList);
 
-  const scored = POKEMON_LIST.filter((p) => !taken.has(p.name) && p.cost <= remaining)
-    .map((p) => ({ ...p, score: (freq[p.type1] || 0) + (freq[p.type2] || 0) }))
-    .filter((p) => p.score > 0)
-    .sort((a, b) => b.score - a.score || b.cost - a.cost);
+  const rosterMons = roster.map((p) => POKEMON_LIST.find((m) => m.name === p.pokemon)).filter(Boolean);
+  const rosterTypes = new Set();
+  rosterMons.forEach((m) => {
+    if (m.type1) rosterTypes.add(m.type1);
+    if (m.type2) rosterTypes.add(m.type2);
+  });
 
-  const topTypes = Object.entries(freq)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 2)
-    .map(([t]) => t);
+  // How exposed the roster already is to each attacking type.
+  const weakness = {};
+  for (const atk of ALL_TYPES) {
+    let w = 0;
+    for (const m of rosterMons) {
+      const mult = effectiveness(atk, [m.type1, m.type2]);
+      if (mult >= 2) w += mult === 4 ? 2 : 1;
+      else if (mult === 0) w -= 0.5;
+    }
+    weakness[atk] = w;
+  }
 
-  return { hasHistory: true, items: scored.slice(0, limit), topTypes };
+  const targetPricePerSlot = remaining / slotsLeft;
+  const candidates = POKEMON_LIST.filter((p) => !taken.has(p.name) && p.cost <= remaining);
+  if (candidates.length === 0) return [];
+
+  const raw = candidates.map((p) => {
+    const meta = metaCache[p.slug];
+    const bst = meta?.bst ?? null;
+    const value = (bst ?? p.cost * 55) / p.cost; // sane fallback before stats load
+
+    let patch = 0;
+    for (const atk of ALL_TYPES) {
+      if (weakness[atk] <= 0) continue;
+      const mult = effectiveness(atk, [p.type1, p.type2]);
+      if (mult === 0) patch += weakness[atk] * 1.5;
+      else if (mult < 1) patch += weakness[atk] * 0.75;
+      else if (mult >= 2) patch -= weakness[atk] * 0.5; // stacks an existing hole
+    }
+
+    let synergy = 0;
+    const partners1 = p.type1 ? synergyPartners(p.type1) : new Set();
+    const partners2 = p.type2 ? synergyPartners(p.type2) : new Set();
+    for (const rt of rosterTypes) {
+      if (partners1.has(rt) || partners2.has(rt)) synergy += 1;
+    }
+    if (p.type1 && !rosterTypes.has(p.type1)) synergy += 0.3;
+    if (p.type2 && !rosterTypes.has(p.type2)) synergy += 0.3;
+
+    const pace = 1 - Math.min(1, Math.abs(p.cost - targetPricePerSlot) / Math.max(targetPricePerSlot, p.cost, 1));
+
+    return { ...p, bst, value, patch, synergy, pace };
+  });
+
+  const norm = (key) => {
+    const vals = raw.map((r) => r[key]);
+    const min = Math.min(...vals);
+    const span = Math.max(...vals) - min || 1;
+    return (v) => (v - min) / span;
+  };
+  const nValue = norm("value"), nPatch = norm("patch"), nSynergy = norm("synergy"), nPace = norm("pace");
+
+  const scored = raw.map((r) => {
+    const score = 0.35 * nValue(r.value) + 0.35 * nPatch(r.patch) + 0.15 * nSynergy(r.synergy) + 0.15 * nPace(r.pace);
+    let reason = "solid all-around pick";
+    if (nPatch(r.patch) > 0.7) reason = "covers a type hole in your roster";
+    else if (nValue(r.value) > 0.7) reason = r.bst ? `great value — ${r.bst} BST for ${r.cost} pts` : `efficient at ${r.cost} pts`;
+    else if (nSynergy(r.synergy) > 0.7 && rosterTypes.size) reason = "classic type-core fit with your team";
+    return { ...r, score, reason };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored;
+}
+
+function computeSuggestions(team, picksList = picks, limit = 4) {
+  return scoreCandidates(team, picksList).slice(0, limit);
+}
+
+// A bot's pick: weighted-random among its top few scored candidates so
+// mock drafts aren't perfectly deterministic. Falls back to the cheapest
+// available mon if nothing is affordable, so the draft never stalls.
+function chooseBotPick(team, picksList) {
+  const scored = scoreCandidates(team, picksList);
+  if (scored.length === 0) {
+    const taken = pickedNames(picksList);
+    return POKEMON_LIST.filter((p) => !taken.has(p.name)).sort((a, b) => a.cost - b.cost)[0] || null;
+  }
+  const pool = scored.slice(0, Math.min(5, scored.length));
+  const weights = pool.map((p) => Math.max(0.05, p.score));
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < pool.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return pool[i];
+  }
+  return pool[0];
 }
 
 function renderSuggestions() {
   const box = el("suggestions");
   if (!box) return;
 
-  const turn = currentTurnTeam();
-  const shouldShow = suggestionsEnabled && myTeam && turn === myTeam && !finalized;
+  const team = activeMyTeam();
+  const turn = activeTurnTeam();
+  const relevantlyActive = mockMode ? !!(mockStatus?.active && iAmLockedIn()) : !finalized;
+  const shouldShow = suggestionsEnabled && team && turn === team && relevantlyActive;
   if (!shouldShow) {
     box.classList.remove("show");
     box.innerHTML = "";
     return;
   }
 
-  const { hasHistory, items, topTypes } = computeSuggestions(myTeam);
+  const items = computeSuggestions(team, activeList());
   box.classList.add("show");
 
-  if (!hasHistory) {
-    box.innerHTML = `<div class="suggestions-empty">💡 No draft history yet for ${myTeam} — suggestions appear once you've completed at least one past draft in this room.</div>`;
-    return;
-  }
   if (items.length === 0) {
-    box.innerHTML = `<div class="suggestions-empty">💡 Nothing left in the pool fits ${myTeam}'s usual picks (mostly ${topTypes.join(" & ")}-type) within your remaining budget.</div>`;
+    box.innerHTML = `<div class="suggestions-empty">💡 Nothing left in the pool fits ${team}'s remaining budget.</div>`;
     return;
   }
 
   box.innerHTML = `
-    <div class="suggestions-head">💡 Suggested for ${myTeam} — based on past picks (favors ${topTypes.join(" & ")}-type)</div>
+    <div class="suggestions-head">💡 Suggested for ${team} — stats, typing &amp; team fit</div>
     <div class="suggestions-list">
       ${items
         .map(
           (p) => `
-        <button class="suggestion-chip" data-name="${p.name}">
+        <button class="suggestion-chip" data-name="${p.name}" title="${p.reason}">
           ${spriteBox(p, "xs")}
           <span class="sugg-name">${p.name}</span>
           <span class="sugg-cost">${p.cost}</span>
@@ -569,7 +773,111 @@ function renderSuggestions() {
   hydrateSprites(box);
 }
 
+// ---------- Mock draft panel ----------
+
+function renderMockBar() {
+  const bar = el("mockBar");
+  if (!bar) return;
+  document.body.classList.toggle("mock-active", mockMode);
+
+  if (!mockMode) {
+    bar.innerHTML = `<button id="mockToggleOn" class="link-btn mock-enter-link">🧪 Try a mock draft — practice vs. bots</button>`;
+    el("mockToggleOn").onclick = () => {
+      mockMode = true;
+      localStorage.setItem("draft_mock_mode", "1");
+      renderAll();
+      maybeScheduleBotMove();
+    };
+    return;
+  }
+
+  if (!iAmLockedIn()) {
+    const takenByOthers = new Set(
+      Object.keys(mockControllers).filter((t) => mockControllers[t] && mockControllers[t] !== clientId)
+    );
+    bar.innerHTML = `
+      <div class="mock-setup">
+        <div class="mock-setup-head">🧪 Mock Draft Mode — practice against bots. ${mockStatus?.active ? "A session is already running — jump in on an open team." : "Pick your team to begin."}</div>
+        <div class="mock-setup-row">
+          <select id="mockTeamSelect">
+            <option value="">Choose your team…</option>
+            ${TEAMS.map(
+              (t) =>
+                `<option value="${t.name}" ${t.name === mockMyTeam ? "selected" : ""} ${takenByOthers.has(t.name) ? "disabled" : ""}>${t.name}${takenByOthers.has(t.name) ? " (taken)" : ""}</option>`
+            ).join("")}
+          </select>
+          <button id="mockStartBtn" class="finalize-btn mock-start-btn">▶ Start Mock Draft</button>
+          <button id="mockExitBtn" class="link-btn">Exit mock mode</button>
+        </div>
+      </div>`;
+    el("mockTeamSelect").onchange = (e) => {
+      mockMyTeam = e.target.value;
+    };
+    el("mockStartBtn").onclick = async () => {
+      if (!mockMyTeam) {
+        alert("Choose a team first.");
+        return;
+      }
+      const ok = await claimMockTeam(DRAFT_ROOM, mockMyTeam, clientId);
+      if (!ok) {
+        alert("That team was just claimed by another player — pick a different one.");
+        return;
+      }
+      localStorage.setItem("draft_mock_team", mockMyTeam);
+      if (!mockStatus?.active) await startMockSession(DRAFT_ROOM);
+      renderAll();
+      maybeScheduleBotMove();
+    };
+    el("mockExitBtn").onclick = () => {
+      mockMode = false;
+      localStorage.setItem("draft_mock_mode", "0");
+      renderAll();
+    };
+    return;
+  }
+
+  bar.innerHTML = `
+    <div class="mock-setup locked">
+      <span>🧪 Mock draft — locked in as <b>${mockMyTeam}</b>. Every other open team is bot-controlled.</span>
+      <div class="mock-setup-row">
+        <button id="mockResetBtn" class="danger-btn small">♻️ Restart mock draft</button>
+        <button id="mockExitBtn" class="link-btn">Exit mock mode</button>
+      </div>
+    </div>`;
+  el("mockResetBtn").onclick = () => {
+    if (!confirm("Restart the mock draft? This clears it for everyone currently practicing in this room.")) return;
+    resetMockDraft(DRAFT_ROOM);
+  };
+  el("mockExitBtn").onclick = () => {
+    mockMode = false;
+    localStorage.setItem("draft_mock_mode", "0");
+    renderAll();
+  };
+}
+
+// If it's a bot's turn in an active mock session, schedule that bot to
+// "think" for a moment and then submit a pick. Any connected client in
+// mock mode can trigger this — submitMockPick's transaction guarantees
+// only one write actually lands even if several clients race.
+function maybeScheduleBotMove() {
+  if (mockBotTimer) {
+    clearTimeout(mockBotTimer);
+    mockBotTimer = null;
+  }
+  if (!mockMode || !mockStatus?.active) return;
+  const turn = currentTurnTeam(mockPicks);
+  if (!turn) return; // mock draft complete
+  const isBot = !mockControllers[turn];
+  if (!isBot) return;
+
+  mockBotTimer = setTimeout(() => {
+    const pick = chooseBotPick(turn, mockPicks);
+    if (pick) submitMockPick(DRAFT_ROOM, DRAFT_ORDER, turn, pick.name, pick.cost);
+  }, 700 + Math.random() * 900);
+}
+
 function renderAll() {
+  renderMockBar();
   renderStatus();
   renderFinalizeControl();
   renderBoard();
@@ -582,14 +890,39 @@ function renderAll() {
 // ---------- Actions ----------
 
 function draftPokemon(name) {
+  const mon = POKEMON_LIST.find((p) => p.name === name);
+  if (!mon) return;
+
+  if (mockMode) {
+    if (!mockStatus?.active) {
+      alert("Start the mock draft first.");
+      return;
+    }
+    if (!iAmLockedIn()) {
+      alert("Pick a team and hit Start Mock Draft to play.");
+      return;
+    }
+    const turn = activeTurnTeam();
+    if (turn !== mockMyTeam) {
+      alert(`It's not your turn — ${turn} is on the clock.`);
+      return;
+    }
+    const spent = costsByTeam(mockPicks)[mockMyTeam] || 0;
+    const remaining = (TEAM_BUDGETS[mockMyTeam] ?? 100) - spent;
+    if (mon.cost > remaining) {
+      alert(`${name} costs ${mon.cost} pts — you only have ${remaining} left.`);
+      return;
+    }
+    submitMockPick(DRAFT_ROOM, DRAFT_ORDER, mockMyTeam, mon.name, mon.cost);
+    return;
+  }
+
   if (finalized) return;
   const turn = currentTurnTeam();
   if (turn !== myTeam) {
     alert(`It's not your turn — ${turn} is on the clock.`);
     return;
   }
-  const mon = POKEMON_LIST.find((p) => p.name === name);
-  if (!mon) return;
   const spent = costsByTeam()[myTeam] || 0;
   const remaining = (TEAM_BUDGETS[myTeam] ?? 100) - spent;
   if (mon.cost > remaining) {
@@ -636,6 +969,21 @@ function init() {
   subscribeToHistory(DRAFT_ROOM, (flatPicks) => {
     history = flatPicks;
     renderAll();
+  });
+  subscribeToMockPicks(DRAFT_ROOM, (list) => {
+    mockPicks = list;
+    renderAll();
+    maybeScheduleBotMove();
+  });
+  subscribeToMockControllers(DRAFT_ROOM, (ctrl) => {
+    mockControllers = ctrl;
+    renderAll();
+    maybeScheduleBotMove();
+  });
+  subscribeToMockStatus(DRAFT_ROOM, (status) => {
+    mockStatus = status;
+    renderAll();
+    maybeScheduleBotMove();
   });
 }
 

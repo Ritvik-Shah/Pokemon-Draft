@@ -13,6 +13,7 @@ import {
   query,
   limitToLast,
   off,
+  runTransaction,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 
 let db = null;
@@ -101,4 +102,72 @@ export function subscribeToHistory(roomKey, onChange) {
     }
     onChange(flat);
   });
+}
+
+// ---------- Mock draft ----------
+// Lives entirely under rooms/{roomKey}/mock/* — a completely separate
+// tree from the real draft's picks/finalized/history, so practicing never
+// touches the real board. Everything here is transactional because
+// multiple browsers (humans clicking, or several clients simultaneously
+// noticing it's a bot's turn) can race to write at the same moment.
+
+export function subscribeToMockPicks(roomKey, onChange) {
+  onValue(ref(db, `rooms/${roomKey}/mock/picksList`), (snapshot) => onChange(snapshot.val() || []));
+}
+
+export function subscribeToMockControllers(roomKey, onChange) {
+  onValue(ref(db, `rooms/${roomKey}/mock/controllers`), (snapshot) => onChange(snapshot.val() || {}));
+}
+
+export function subscribeToMockStatus(roomKey, onChange) {
+  onValue(ref(db, `rooms/${roomKey}/mock/status`), (snapshot) => onChange(snapshot.val() || null));
+}
+
+// Tries to claim `team` for `clientId`. Succeeds if the team is unclaimed
+// or already claimed by this same client (e.g. reloading the page).
+// Returns true/false rather than throwing, so callers can just check it.
+export async function claimMockTeam(roomKey, team, clientId) {
+  try {
+    const target = ref(db, `rooms/${roomKey}/mock/controllers/${team}`);
+    const result = await runTransaction(target, (current) => {
+      if (current == null || current === clientId) return clientId;
+      return; // abort — someone else already has this team
+    });
+    return result.committed && result.snapshot.val() === clientId;
+  } catch {
+    return false;
+  }
+}
+
+export function startMockSession(roomKey) {
+  return set(ref(db, `rooms/${roomKey}/mock/status`), { active: true, startedAt: Date.now() });
+}
+
+// Atomically appends a pick only if it's genuinely still `team`'s turn and
+// that Pokémon hasn't already been taken. Safe against duplicate bot
+// writes: if two clients' transactions collide, Firebase retries the
+// loser with fresh data and it aborts itself once the turn has moved on.
+export async function submitMockPick(roomKey, draftOrder, team, pokemon, cost) {
+  try {
+    const target = ref(db, `rooms/${roomKey}/mock/picksList`);
+    const result = await runTransaction(target, (current) => {
+      const list = current || [];
+      const turnTeam = list.length < draftOrder.length ? draftOrder[list.length] : null;
+      if (turnTeam !== team) return; // no longer this team's turn — abort
+      if (list.some((p) => p.pokemon === pokemon)) return; // already taken — abort
+      list.push({ team, pokemon, cost });
+      return list;
+    });
+    return result.committed;
+  } catch {
+    return false;
+  }
+}
+
+export function resetMockDraft(roomKey) {
+  return Promise.all([
+    set(ref(db, `rooms/${roomKey}/mock/picksList`), null),
+    set(ref(db, `rooms/${roomKey}/mock/controllers`), null),
+    set(ref(db, `rooms/${roomKey}/mock/status`), null),
+  ]);
 }
