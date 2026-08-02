@@ -536,10 +536,109 @@ function computeTeamPower(teamName, picksList = picks) {
   return { power, cost, avgBST, coverage: types.size, statsCoveragePct };
 }
 
+// ---------- Matchup-aware doubles simulation ----------
+// The real league plays doubles with each side choosing 4 of their 10
+// drafted Pokémon per matchup. You know your opponent's full drafted
+// roster going in — just not which 4 they'll actually bring — so the
+// modeled strategy here is "pick the 4 that best answer their entire
+// roster": strong on their own stats, good average offense into
+// whatever the opponent could send out, and not broadly walled by them
+// defensively. That selection is redone for every scheduled game, since
+// the right 4 depends on who you're facing.
+
+function rosterMonObjects(teamPicks) {
+  return teamPicks
+    .map((p) => {
+      const mon = POKEMON_LIST.find((m) => m.name === p.pokemon);
+      if (!mon) return null;
+      const bst = metaCache[mon.slug]?.bst ?? null;
+      return { ...mon, cost: p.cost, bst: bst ?? 400 };
+    })
+    .filter(Boolean);
+}
+
+// The strongest single-hit multiplier `attacker` can land on `defender`,
+// using whichever of its (up to two) types is more effective.
+function bestOffenseMultiplier(attacker, defender) {
+  const m1 = effectiveness(attacker.type1, [defender.type1, defender.type2]);
+  const m2 = attacker.type2 ? effectiveness(attacker.type2, [defender.type1, defender.type2]) : 0;
+  return Math.max(m1, m2);
+}
+
+// Greedily picks the 4 mons from `myRoster` that best answer `oppRoster`
+// as a whole, since the opponent's specific 4-mon pick is unknown.
+function pickMatchupLineup(myRoster, oppRoster) {
+  if (myRoster.length <= 4) return myRoster;
+  const n = oppRoster.length || 1;
+  const scored = myRoster.map((mon) => {
+    let atkSum = 0, defSum = 0;
+    for (const opp of oppRoster) {
+      atkSum += bestOffenseMultiplier(mon, opp);
+      defSum += bestOffenseMultiplier(opp, mon);
+    }
+    const avgAtk = atkSum / n;
+    const avgDef = defSum / n; // lower is better — less exposure to the opponent's pool
+    return { mon, score: mon.bst / 6 + avgAtk * 12 - avgDef * 8 };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 4).map((s) => s.mon);
+}
+
+// One simulated doubles game between two chosen 4-mon lineups. A "wipe"
+// is an opposing mon that this lineup has a >=2x edge into from at least
+// one of its own mons — a rough proxy for "we'd knock that thing out."
+// Each wipe is credited to whichever specific mon earned it, for MVP
+// tracking. Game power blends average lineup BST with wipes dealt vs.
+// taken.
+function evaluateMatchup(lineupA, lineupB) {
+  const creditsA = new Map(), creditsB = new Map();
+
+  const countWipes = (attackers, defenders, credits) => {
+    let wipes = 0;
+    for (const d of defenders) {
+      let best = null, bestMult = -1;
+      for (const a of attackers) {
+        const mult = bestOffenseMultiplier(a, d);
+        if (mult > bestMult) { bestMult = mult; best = a; }
+      }
+      if (bestMult >= 2) {
+        wipes++;
+        credits.set(best.name, (credits.get(best.name) || 0) + 1);
+      }
+    }
+    return wipes;
+  };
+
+  const wipesA = countWipes(lineupA, lineupB, creditsA);
+  const wipesB = countWipes(lineupB, lineupA, creditsB);
+
+  const avgBstA = lineupA.reduce((s, m) => s + m.bst, 0) / lineupA.length;
+  const avgBstB = lineupB.reduce((s, m) => s + m.bst, 0) / lineupB.length;
+
+  const powerA = avgBstA / 6 + wipesA * 6 - wipesB * 3;
+  const powerB = avgBstB / 6 + wipesB * 6 - wipesA * 3;
+
+  return { powerA, powerB, creditsA, creditsB };
+}
+
+// A mon's net type-effectiveness edge against every other drafted mon in
+// the league (excluding its own teammates, who it never fights) — a
+// season-long "how good is this typing against the whole field" signal,
+// independent of any one scheduled matchup.
+function leagueEffectivenessScore(mon, allOtherMons) {
+  if (!allOtherMons.length) return 0;
+  let net = 0;
+  for (const other of allOtherMons) {
+    net += bestOffenseMultiplier(mon, other) - bestOffenseMultiplier(other, mon);
+  }
+  return net / allOtherMons.length;
+}
+
 function computePredictions(picksList = picks) {
   const teamNames = TEAMS.map((t) => t.name);
   const powerByTeam = Object.fromEntries(teamNames.map((n) => [n, computeTeamPower(n, picksList)]));
-  const strengthByTeam = Object.fromEntries(teamNames.map((n) => [n, powerByTeam[n].power]));
+  const byTeam = picksByTeam(picksList);
+  const rosterByTeam = Object.fromEntries(teamNames.map((n) => [n, rosterMonObjects(byTeam[n] || [])]));
 
   // A true single round-robin: every team plays every other team exactly
   // once, so N teams get a record out of N-1 games. With an odd team
@@ -552,15 +651,49 @@ function computePredictions(picksList = picks) {
   const schedule = generateRoundRobinSchedule(teamNames, totalRounds);
 
   const expectedWins = Object.fromEntries(teamNames.map((n) => [n, 0]));
+  // Per-mon MVP tallies: how often each mon got picked into that team's
+  // matchup lineup, and how many wipes it personally earned.
+  const mvpTally = Object.fromEntries(
+    teamNames.map((n) => [n, Object.fromEntries(rosterByTeam[n].map((m) => [m.name, { appearances: 0, wipes: 0 }]))])
+  );
+
   for (const week of schedule) {
     for (const [a, b] of week) {
-      const pA = winProbability(strengthByTeam[a], strengthByTeam[b]);
+      const rosterA = rosterByTeam[a], rosterB = rosterByTeam[b];
+      const lineupA = pickMatchupLineup(rosterA, rosterB);
+      const lineupB = pickMatchupLineup(rosterB, rosterA);
+      const { powerA, powerB, creditsA, creditsB } = evaluateMatchup(lineupA, lineupB);
+
+      const pA = winProbability(powerA, powerB);
       expectedWins[a] += pA;
       expectedWins[b] += 1 - pA;
+
+      for (const mon of lineupA) mvpTally[a][mon.name].appearances++;
+      for (const mon of lineupB) mvpTally[b][mon.name].appearances++;
+      for (const [name, count] of creditsA) mvpTally[a][name].wipes += count;
+      for (const [name, count] of creditsB) mvpTally[b][name].wipes += count;
     }
   }
 
-  const maxStrength = Math.max(...teamNames.map((n) => strengthByTeam[n]), 1);
+  // MVP per team: best blend of how often it played, how many wipes it
+  // earned per game played, and its type-effectiveness edge against the
+  // whole league's drafted pool.
+  const mvpByTeam = {};
+  for (const name of teamNames) {
+    const others = teamNames.filter((n) => n !== name).flatMap((n) => rosterByTeam[n]);
+    let best = null;
+    for (const mon of rosterByTeam[name]) {
+      const tally = mvpTally[name][mon.name];
+      const apps = tally.appearances / gamesPerTeam;
+      const wipeRate = tally.wipes / gamesPerTeam;
+      const leagueEdge = leagueEffectivenessScore(mon, others);
+      const score = apps * 0.25 + wipeRate * 0.5 + leagueEdge * 0.25;
+      if (!best || score > best.score) best = { mon, appearances: tally.appearances, wipes: tally.wipes, leagueEdge, score };
+    }
+    mvpByTeam[name] = best;
+  }
+
+  const maxStrength = Math.max(...teamNames.map((n) => powerByTeam[n].power), 1);
 
   const standings = teamNames.map((name) => {
     const p = powerByTeam[name];
@@ -576,12 +709,18 @@ function computePredictions(picksList = picks) {
       statsCoveragePct: p.statsCoveragePct,
       expectedWins: xWins,
       record: `${wins}-${gamesPerTeam - wins}`,
+      mvp: mvpByTeam[name],
     };
   });
 
   standings.sort((a, b) => b.expectedWins - a.expectedWins || b.strength - a.strength);
   standings.forEach((r, i) => (r.rank = i + 1));
 
+  // The playoff bracket keeps using season-long team power (not the
+  // matchup-specific lineups) — that's the randomness the user already
+  // approved, and best-of-one playoff games aren't scheduled matchups
+  // with a known opponent roster the same way round-robin games are.
+  const strengthByTeam = Object.fromEntries(teamNames.map((n) => [n, powerByTeam[n].power]));
   const bracket = computePlayoffBracket(standings, strengthByTeam);
   return { standings, bracket, gamesPerTeam };
 }
@@ -644,7 +783,7 @@ function renderPredictions() {
     <div class="predictions-head">
       <div class="eyebrow">${mockMode ? "Mock Draft Projection" : "Season Projection"}</div>
       <h2>${mockMode ? "Your Practice Draft — Standings &amp; Playoffs" : "Projected Standings &amp; Playoffs"}</h2>
-      <p>Strength blends draft cost spent, each roster's average base stat total (live from PokeAPI), and a small bonus for type coverage. Records come from a single round-robin — every team plays every other team once, for a record out of ${gamesPerTeam}. The top 4 then run a single-elimination bracket, simulated game by game, so the eventual champion isn't guaranteed to be the #1 seed. For fun — not an official schedule.${mockMode ? " This is your own private practice run, not the real draft." : ""}</p>
+      <p>Every round-robin game picks each side's best 4-of-10 doubles lineup against the OTHER team's entire drafted roster (you know what they drafted, not which 4 they'll bring), then compares average stats plus simulated "wipes" — favorable type matchups — to set the odds. Every team plays every other team once, for a record out of ${gamesPerTeam}. The top 4 then run a single-elimination bracket, simulated game by game, so the eventual champion isn't guaranteed to be the #1 seed. MVP blends how often a mon made the lineup, how many wipes it earned, and its type-effectiveness edge against the whole league. For fun — not an official schedule.${mockMode ? " This is your own private practice run, not the real draft." : ""}</p>
       ${stillLoading ? `<p class="stats-loading-note">Still pulling live base stats for some Pokémon — this refines automatically as they load.</p>` : ""}
     </div>
     ${bracket ? renderBracketHTML(bracket, mockMode) : ""}
@@ -653,24 +792,28 @@ function renderPredictions() {
         <span class="pred-rank"></span>
         <span class="pred-team">Team</span>
         <span class="pred-sub">Avg BST</span>
-        <span class="pred-sub">Types</span>
+        <span class="pred-mvp-head">MVP</span>
         <div class="pred-bar"></div>
         <span class="pred-strength">Power</span>
         <span class="pred-record">Record</span>
       </div>
       ${standings
-        .map(
-          (r) => `
+        .map((r) => {
+          const mvp = r.mvp;
+          const mvpTitle = mvp
+            ? `${mvp.mon.name}: ${mvp.appearances}/${gamesPerTeam} games, ${mvp.wipes} wipes, ${mvp.leagueEdge >= 0 ? "+" : ""}${mvp.leagueEdge.toFixed(2)} league type edge`
+            : "";
+          return `
         <div class="pred-row ${r.rank <= 4 ? "seeded" : ""}">
           <span class="pred-rank">#${r.rank}</span>
           <span class="pred-team">${r.name}${r.rank <= 4 ? `<span class="seed-tag">SEED ${r.rank}</span>` : ""}</span>
           <span class="pred-sub">${r.avgBST != null ? r.avgBST : "—"}</span>
-          <span class="pred-sub">${r.coverage}</span>
+          <span class="pred-mvp" title="${mvpTitle}">${mvp ? spriteBox(mvp.mon, "xs") : ""}<span class="pred-mvp-name">${mvp ? mvp.mon.name : "—"}</span></span>
           <div class="pred-bar"><div class="pred-bar-fill" style="width:${r.strengthPct}%"></div></div>
           <span class="pred-strength">${r.strength}</span>
           <span class="pred-record">${r.record}</span>
-        </div>`
-        )
+        </div>`;
+        })
         .join("")}
     </div>
     <div class="predictions-actions">
@@ -679,6 +822,7 @@ function renderPredictions() {
         ? `<button id="mockRestartBtn" class="danger-btn">${icon("restart")}Restart mock draft</button>`
         : `<button id="resetDraftBtn" class="danger-btn">${icon("restart")}Reset &amp; start a new draft</button>`}
     </div>`;
+  hydrateSprites(container);
 
   el("exportCsvBtn").onclick = () => exportDraftCSV(list, mockMode);
   if (mockMode) {
@@ -719,9 +863,13 @@ function exportDraftCSV(picksList = picks, isMock = false) {
 
   rows.push([]);
   rows.push([`Round-Robin Standings (record out of ${gamesPerTeam})`]);
-  rows.push(["Rank", "Team", "Power Score", "Draft Cost", "Avg Base Stat Total", "Type Coverage", "Record", "Playoff Seed"]);
+  rows.push(["Rank", "Team", "Power Score", "Draft Cost", "Avg Base Stat Total", "Type Coverage", "Record", "Playoff Seed", "MVP", "MVP Appearances", "MVP Wipes", "MVP League Type Edge"]);
   standings.forEach((r) => {
-    rows.push([r.rank, r.name, r.strength, r.cost, r.avgBST ?? "n/a", r.coverage, r.record, r.rank <= 4 ? r.rank : ""]);
+    const mvp = r.mvp;
+    rows.push([
+      r.rank, r.name, r.strength, r.cost, r.avgBST ?? "n/a", r.coverage, r.record, r.rank <= 4 ? r.rank : "",
+      mvp ? mvp.mon.name : "", mvp ? `${mvp.appearances}/${gamesPerTeam}` : "", mvp ? mvp.wipes : "", mvp ? mvp.leagueEdge.toFixed(2) : "",
+    ]);
   });
 
   if (bracket) {
