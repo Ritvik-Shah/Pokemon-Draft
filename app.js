@@ -232,6 +232,33 @@ function renderStatus() {
   statusEl.innerHTML = `<span class="live-dot"></span>Pick <b>${list.length + 1}</b> / ${DRAFT_ORDER.length} · Round <b>${currentRound(list)}</b> · On the clock: <span class="onclock ${isMe ? "me" : ""}">${turn}</span>${botTag}${isMe ? " — that's you!" : ""}`;
 }
 
+// Top-banner strip showing whatever was picked most recently, so anyone
+// glancing at the page — not just the person on the clock — can see
+// what just got taken without hunting through the board.
+function renderLastPick() {
+  const bar = el("lastPickBar");
+  if (!bar) return;
+
+  const list = activeList();
+  if (!list.length) {
+    bar.classList.remove("show");
+    bar.innerHTML = "";
+    return;
+  }
+
+  const last = list[list.length - 1];
+  const mon = POKEMON_LIST.find((m) => m.name === last.pokemon);
+  bar.classList.add("show");
+  bar.style.setProperty("--team-color", teamColor(last.team));
+  bar.innerHTML = `
+    <span class="last-pick-label">Last pick</span>
+    ${mon ? spriteBox(mon, "xs") : ""}
+    <span class="last-pick-name">${last.pokemon}</span>
+    <span class="last-pick-team">${last.team}</span>
+    <span class="last-pick-cost">${last.cost} pts</span>`;
+  hydrateSprites(bar);
+}
+
 function renderBoard() {
   const list = activeList();
   const costs = costsByTeam(list);
@@ -842,7 +869,7 @@ function renderMockBar() {
   document.body.classList.toggle("mock-active", mockMode);
 
   if (!mockMode) {
-    bar.innerHTML = `<button id="mockToggleOn" class="link-btn mock-enter-link">Try a mock draft — practice vs. bots</button>`;
+    bar.innerHTML = `<button id="mockToggleOn" class="secondary-btn mock-enter-btn">Try a mock draft — practice vs. bots</button>`;
     el("mockToggleOn").onclick = () => {
       mockMode = true;
       localStorage.setItem("draft_mock_mode", "1");
@@ -930,6 +957,7 @@ function maybeScheduleBotMove() {
 function renderAll() {
   renderMockBar();
   renderStatus();
+  renderLastPick();
   renderFinalizeControl();
   renderBoard();
   renderSuggestions();
