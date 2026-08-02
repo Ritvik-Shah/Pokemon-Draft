@@ -12,7 +12,7 @@ const TEAMS = [
   { name: "Tokyo Totodiles", budget: 100 },
   { name: "Toronto Turtwigs",   budget: 100 },
   { name: "Atlanta Agumon",    budget: 100 },
-  { name: "Buffalo Bishop", budget: 100 },
+  { name: "Buffalo Bisharp", budget: 100 },
   { name: "Salt Lake City Snivys", budget: 100 },
   { name: "Lithuania Lugia", budget: 100 },
   { name: "Ottawa Oshawotts",    budget: 100 }, 
