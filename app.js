@@ -25,10 +25,23 @@ const TYPE_COLORS = {
 // Distinct identity colors assigned in draft order — used consistently
 // across the board, standings, and suggestions so each team reads as the
 // same "team" everywhere on the page, not just a gray card with a label.
-const TEAM_COLORS = ["#FF4753", "#C6FF4D", "#4DD8FF", "#C792FF", "#FFB74D", "#FF80B8", "#38E0B4", "#7C93FF"];
+const TEAM_COLORS = ["#4F8DFD", "#F2555B", "#38B673", "#E2A23B", "#A37BF2", "#3ECFC8", "#F0789E", "#8BA0B3"];
 function teamColor(name) {
   const idx = TEAMS.findIndex((t) => t.name === name);
   return TEAM_COLORS[idx >= 0 ? idx % TEAM_COLORS.length : 0];
+}
+
+// Small inline icon set (stroke-based, sized via CSS) used in place of
+// emoji so status/action affordances render consistently across devices.
+const ICON = {
+  lock: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>`,
+  check: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
+  trophy: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 21h8M12 17v4M7 4h10v4a5 5 0 0 1-10 0V4Z"/><path d="M7 5H4a1 1 0 0 0-1 1 5 5 0 0 0 4 4.9M17 5h3a1 1 0 0 1 1 1 5 5 0 0 1-4 4.9"/></svg>`,
+  download: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><polyline points="7 10 12 15 17 10"/><path d="M5 21h14"/></svg>`,
+  restart: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 1 3 6.7"/><polyline points="3 16 3 21 8 21"/></svg>`,
+};
+function icon(name, cls = "") {
+  return `<span class="icon ${cls}">${ICON[name]}</span>`;
 }
 
 let picks = []; // synced from Firebase, oldest -> newest
@@ -208,8 +221,8 @@ function renderStatus() {
 
   if (turn === null) {
     statusEl.innerHTML = mockMode
-      ? `<span class="done">Mock draft complete! 🎉 Restart below to practice again.</span>`
-      : `<span class="done">Draft complete 🎉</span>`;
+      ? `<span class="done">${icon("check")}Mock draft complete — restart below to practice again.</span>`
+      : `<span class="done">${icon("check")}Draft complete</span>`;
     return;
   }
 
@@ -253,7 +266,7 @@ function renderBoard() {
               ${mon ? spriteBox(mon, "xs") : ""}
               <span class="pick-name">${p.pokemon}</span>
               <span class="pick-cost">${p.cost}</span>
-              ${!mockMode && !finalized ? `<button class="undo-btn" title="Undo this pick" data-key="${p.key}">✕</button>` : ""}
+              ${!mockMode && !finalized ? `<button class="undo-btn" title="Undo this pick" data-key="${p.key}">&times;</button>` : ""}
             </div>`;
             })
             .join("") || `<div class="empty-slot">No picks yet</div>`}
@@ -327,7 +340,7 @@ function renderFinalizeControl() {
   if (finalized) {
     bar.innerHTML = `
       <div class="finalize-status locked">
-        <span>🔒 Teams are finalized${finalizedBy ? ` (confirmed by ${finalizedBy})` : ""} — picks are locked in.</span>
+        <span>${icon("lock")}Teams are finalized${finalizedBy ? ` (confirmed by ${finalizedBy})` : ""} — picks are locked in.</span>
         <button id="unlockBtn" class="link-btn">Not final? Unlock</button>
       </div>`;
     el("unlockBtn").onclick = () => {
@@ -335,7 +348,7 @@ function renderFinalizeControl() {
       setFinalized(DRAFT_ROOM, false, null);
     };
   } else if (draftDone) {
-    bar.innerHTML = `<button id="finalizeBtn" class="finalize-btn">✅ Confirm teams are final &amp; lock in projections</button>`;
+    bar.innerHTML = `<button id="finalizeBtn" class="finalize-btn">${icon("check")}Confirm teams are final &amp; lock in projections</button>`;
     el("finalizeBtn").onclick = () => {
       if (!confirm("Lock in the draft as final? Only do this once every team's roster is exactly right — this hides the undo buttons for everyone.")) return;
       setFinalized(DRAFT_ROOM, true, myTeam || null);
@@ -483,10 +496,10 @@ function renderPredictions() {
       <div class="eyebrow">${mockMode ? "Mock Draft Projection" : "Season Projection"}</div>
       <h2>${mockMode ? "Your Practice Draft — Standings &amp; Champion" : "Projected Standings &amp; Champion"}</h2>
       <p>Strength blends draft cost spent, each roster's average base stat total (live from PokeAPI), and a small bonus for type coverage. Simulated across a ${NUM_ROUNDS}-week round-robin. For fun — not an official schedule.${mockMode ? " This is your own private practice run, not the real draft." : ""}</p>
-      ${stillLoading ? `<p class="stats-loading-note">🔄 Still pulling live base stats for some Pokémon — this refines automatically as they load.</p>` : ""}
+      ${stillLoading ? `<p class="stats-loading-note">Still pulling live base stats for some Pokémon — this refines automatically as they load.</p>` : ""}
     </div>
     <div class="champion-card">
-      <span class="crown">👑</span>
+      <span class="crown">${ICON.trophy}</span>
       <div>
         <div class="champion-label">${mockMode ? "Projected Mock Champion" : "Projected Champion"}</div>
         <div class="champion-name">${champ.name}</div>
@@ -518,10 +531,10 @@ function renderPredictions() {
         .join("")}
     </div>
     <div class="predictions-actions">
-      <button id="exportCsvBtn" class="secondary-btn">⬇️ Export CSV</button>
+      <button id="exportCsvBtn" class="secondary-btn">${icon("download")}Export CSV</button>
       ${mockMode
-        ? `<button id="mockRestartBtn" class="danger-btn">♻️ Restart mock draft</button>`
-        : `<button id="resetDraftBtn" class="danger-btn">♻️ Reset &amp; start a new draft</button>`}
+        ? `<button id="mockRestartBtn" class="danger-btn">${icon("restart")}Restart mock draft</button>`
+        : `<button id="resetDraftBtn" class="danger-btn">${icon("restart")}Reset &amp; start a new draft</button>`}
     </div>`;
 
   el("exportCsvBtn").onclick = () => exportDraftCSV(list, mockMode);
@@ -796,12 +809,12 @@ function renderSuggestions() {
   box.classList.add("show");
 
   if (items.length === 0) {
-    box.innerHTML = `<div class="suggestions-empty">💡 Nothing left in the pool fits ${team}'s remaining budget.</div>`;
+    box.innerHTML = `<div class="suggestions-empty">Nothing left in the pool fits ${team}'s remaining budget.</div>`;
     return;
   }
 
   box.innerHTML = `
-    <div class="suggestions-head">💡 Suggested for ${team} — stats, typing, team fit &amp; history</div>
+    <div class="suggestions-head">Suggested for ${team} — stats, typing, team fit &amp; history</div>
     <div class="suggestions-list">
       ${items
         .map(
@@ -829,7 +842,7 @@ function renderMockBar() {
   document.body.classList.toggle("mock-active", mockMode);
 
   if (!mockMode) {
-    bar.innerHTML = `<button id="mockToggleOn" class="link-btn mock-enter-link">🧪 Try a mock draft — practice vs. bots</button>`;
+    bar.innerHTML = `<button id="mockToggleOn" class="link-btn mock-enter-link">Try a mock draft — practice vs. bots</button>`;
     el("mockToggleOn").onclick = () => {
       mockMode = true;
       localStorage.setItem("draft_mock_mode", "1");
@@ -842,7 +855,7 @@ function renderMockBar() {
   if (!iAmLockedIn()) {
     bar.innerHTML = `
       <div class="mock-setup">
-        <div class="mock-setup-head">🧪 Mock Draft Mode — your own private practice run against bots. Pick your team to begin.</div>
+        <div class="mock-setup-head">Mock Draft Mode — your own private practice run against bots. Pick your team to begin.</div>
         <div class="mock-setup-row">
           <select id="mockTeamSelect">
             <option value="">Choose your team…</option>
@@ -850,7 +863,7 @@ function renderMockBar() {
               (t) => `<option value="${t.name}" ${t.name === mockMyTeam ? "selected" : ""}>${t.name}</option>`
             ).join("")}
           </select>
-          <button id="mockStartBtn" class="finalize-btn mock-start-btn">▶ Start Mock Draft</button>
+          <button id="mockStartBtn" class="finalize-btn mock-start-btn">Start Mock Draft</button>
           <button id="mockExitBtn" class="link-btn">Exit mock mode</button>
         </div>
       </div>`;
@@ -877,9 +890,9 @@ function renderMockBar() {
 
   bar.innerHTML = `
     <div class="mock-setup locked">
-      <span>🧪 Mock draft — locked in as <b>${mockMyTeam}</b>. Every other team is bot-controlled. This is your own private practice run — no one else can see or affect it.</span>
+      <span>Mock draft — locked in as <b>${mockMyTeam}</b>. Every other team is bot-controlled. This is your own private practice run — no one else can see or affect it.</span>
       <div class="mock-setup-row">
-        <button id="mockResetBtn" class="danger-btn small">♻️ Restart mock draft</button>
+        <button id="mockResetBtn" class="danger-btn small">${icon("restart")}Restart mock draft</button>
         <button id="mockExitBtn" class="link-btn">Exit mock mode</button>
       </div>
     </div>`;
