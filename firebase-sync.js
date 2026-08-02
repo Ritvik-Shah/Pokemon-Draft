@@ -105,51 +105,40 @@ export function subscribeToHistory(roomKey, onChange) {
 }
 
 // ---------- Mock draft ----------
-// Lives entirely under rooms/{roomKey}/mock/* — a completely separate
-// tree from the real draft's picks/finalized/history, so practicing never
-// touches the real board. Everything here is transactional because
-// multiple browsers (humans clicking, or several clients simultaneously
-// noticing it's a bot's turn) can race to write at the same moment.
+// Lives under rooms/{roomKey}/mockSessions/{clientId}/* — a private,
+// per-browser practice space. Every visitor gets their own isolated mock
+// draft keyed by their clientId, so anyone can run a practice draft
+// against bots at the same time without seeing, or clobbering, anyone
+// else's session. It's still in Firebase (not just localStorage) so a
+// session survives reloads and follows the same client across tabs.
+// submitMockPick stays transactional in case the same client has two
+// tabs open racing to submit a bot's move.
 
-export function subscribeToMockPicks(roomKey, onChange) {
-  onValue(ref(db, `rooms/${roomKey}/mock/picksList`), (snapshot) => onChange(snapshot.val() || []));
+function mockSessionPath(roomKey, clientId, leaf) {
+  return `rooms/${roomKey}/mockSessions/${clientId}/${leaf}`;
 }
 
-export function subscribeToMockControllers(roomKey, onChange) {
-  onValue(ref(db, `rooms/${roomKey}/mock/controllers`), (snapshot) => onChange(snapshot.val() || {}));
+export function subscribeToMockPicks(roomKey, clientId, onChange) {
+  onValue(ref(db, mockSessionPath(roomKey, clientId, "picksList")), (snapshot) => onChange(snapshot.val() || []));
 }
 
-export function subscribeToMockStatus(roomKey, onChange) {
-  onValue(ref(db, `rooms/${roomKey}/mock/status`), (snapshot) => onChange(snapshot.val() || null));
+export function subscribeToMockStatus(roomKey, clientId, onChange) {
+  onValue(ref(db, mockSessionPath(roomKey, clientId, "status")), (snapshot) => onChange(snapshot.val() || null));
 }
 
-// Tries to claim `team` for `clientId`. Succeeds if the team is unclaimed
-// or already claimed by this same client (e.g. reloading the page).
-// Returns true/false rather than throwing, so callers can just check it.
-export async function claimMockTeam(roomKey, team, clientId) {
-  try {
-    const target = ref(db, `rooms/${roomKey}/mock/controllers/${team}`);
-    const result = await runTransaction(target, (current) => {
-      if (current == null || current === clientId) return clientId;
-      return; // abort — someone else already has this team
-    });
-    return result.committed && result.snapshot.val() === clientId;
-  } catch {
-    return false;
-  }
-}
-
-export function startMockSession(roomKey) {
-  return set(ref(db, `rooms/${roomKey}/mock/status`), { active: true, startedAt: Date.now() });
+// Starts (or resumes) this client's private mock session with `team` as
+// the human-controlled side — every other team is bot-controlled.
+export function startMockSession(roomKey, clientId, team) {
+  return set(ref(db, mockSessionPath(roomKey, clientId, "status")), { active: true, team, startedAt: Date.now() });
 }
 
 // Atomically appends a pick only if it's genuinely still `team`'s turn and
 // that Pokémon hasn't already been taken. Safe against duplicate bot
-// writes: if two clients' transactions collide, Firebase retries the
-// loser with fresh data and it aborts itself once the turn has moved on.
-export async function submitMockPick(roomKey, draftOrder, team, pokemon, cost) {
+// writes: if two tabs of the same client race, Firebase retries the loser
+// with fresh data and it aborts itself once the turn has moved on.
+export async function submitMockPick(roomKey, clientId, draftOrder, team, pokemon, cost) {
   try {
-    const target = ref(db, `rooms/${roomKey}/mock/picksList`);
+    const target = ref(db, mockSessionPath(roomKey, clientId, "picksList"));
     const result = await runTransaction(target, (current) => {
       const list = current || [];
       const turnTeam = list.length < draftOrder.length ? draftOrder[list.length] : null;
@@ -164,10 +153,6 @@ export async function submitMockPick(roomKey, draftOrder, team, pokemon, cost) {
   }
 }
 
-export function resetMockDraft(roomKey) {
-  return Promise.all([
-    set(ref(db, `rooms/${roomKey}/mock/picksList`), null),
-    set(ref(db, `rooms/${roomKey}/mock/controllers`), null),
-    set(ref(db, `rooms/${roomKey}/mock/status`), null),
-  ]);
+export function resetMockDraft(roomKey, clientId) {
+  return set(ref(db, `rooms/${roomKey}/mockSessions/${clientId}`), null);
 }

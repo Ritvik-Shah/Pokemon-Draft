@@ -8,9 +8,7 @@ import {
   archiveAndClearDraft,
   subscribeToHistory,
   subscribeToMockPicks,
-  subscribeToMockControllers,
   subscribeToMockStatus,
-  claimMockTeam,
   startMockSession,
   submitMockPick,
   resetMockDraft,
@@ -52,9 +50,8 @@ if (!clientId) {
 }
 let mockMode = localStorage.getItem("draft_mock_mode") === "1";
 let mockMyTeam = localStorage.getItem("draft_mock_team") || "";
-let mockPicks = []; // synced from rooms/{room}/mock/picksList
-let mockControllers = {}; // { TeamName: clientId } — absent/falsy = bot-controlled
-let mockStatus = null; // { active, startedAt } | null
+let mockPicks = []; // synced from rooms/{room}/mockSessions/{clientId}/picksList — private to this client
+let mockStatus = null; // { active, team, startedAt } | null — private to this client
 let mockBotTimer = null;
 
 const el = (id) => document.getElementById(id);
@@ -170,7 +167,7 @@ function activeTurnTeam() {
   return currentTurnTeam(activeList());
 }
 function iAmLockedIn() {
-  return mockMode && !!mockMyTeam && mockControllers[mockMyTeam] === clientId;
+  return mockMode && !!mockMyTeam && !!mockStatus?.active;
 }
 
 // ---------- Rendering ----------
@@ -201,7 +198,7 @@ function renderStatus() {
 
   const isMe = turn === activeMyTeam();
   statusEl.style.setProperty("--team-color", teamColor(turn));
-  const botTag = mockMode && !mockControllers[turn] ? ` <span class="bot-tag">BOT</span>` : "";
+  const botTag = mockMode && turn !== mockMyTeam ? ` <span class="bot-tag">BOT</span>` : "";
   statusEl.innerHTML = `<span class="live-dot"></span>Pick <b>${list.length + 1}</b> / ${DRAFT_ORDER.length} · Round <b>${currentRound(list)}</b> · On the clock: <span class="onclock ${isMe ? "me" : ""}">${turn}</span>${botTag}${isMe ? " — that's you!" : ""}`;
 }
 
@@ -219,10 +216,8 @@ function renderBoard() {
     const pct = Math.min(100, (spent / budget) * 100);
     const tag = !mockMode
       ? ""
-      : mockControllers[t.name] === clientId
+      : t.name === mockMyTeam
       ? `<span class="bot-tag you-tag">YOU</span>`
-      : mockControllers[t.name]
-      ? `<span class="bot-tag human-tag">PLAYER</span>`
       : `<span class="bot-tag">BOT</span>`;
     return `
       <div class="team-col ${isTurn ? "on-turn" : ""}" style="--team-color:${teamColor(t.name)}">
@@ -619,13 +614,34 @@ function synergyPartners(type) {
   return partners;
 }
 
+// How often `team` has drafted each type across every archived past draft
+// in this room. {} for a team with no history — callers treat that as "no
+// signal" rather than special-casing it, so a team's very first pick just
+// falls back to the other scoring signals below.
+function historicTypeAffinity(team) {
+  const freq = {};
+  for (const h of history) {
+    if (h.team !== team) continue;
+    const mon = POKEMON_LIST.find((m) => m.name === h.pokemon);
+    if (!mon) continue;
+    for (const t of [mon.type1, mon.type2]) {
+      if (!t) continue;
+      freq[t] = (freq[t] || 0) + 1;
+    }
+  }
+  return freq;
+}
+
 // Scores every affordable, undrafted Pokémon for `team` against the given
 // picks list, blending:
 //  - stat efficiency (BST per point spent, live from PokeAPI)
 //  - type-weakness patching (does it cover a hole the roster already has)
 //  - classic type-core synergy (a stand-in for "real comps")
 //  - budget pacing (does the cost fit what's left to spend / slots left)
-// No draft history required — works from a completely empty roster.
+//  - historic fit (has this team leaned on this type in past drafts here)
+// A team with no draft history in this room scores 0 on that last signal
+// for every candidate, so it has no effect and picks fall back to the
+// other four signals — i.e. just the best options left on the list.
 function scoreCandidates(team, picksList) {
   const roster = picksByTeam(picksList)[team] || [];
   const spent = costsByTeam(picksList)[team] || 0;
@@ -657,6 +673,8 @@ function scoreCandidates(team, picksList) {
   const candidates = POKEMON_LIST.filter((p) => !taken.has(p.name) && p.cost <= remaining);
   if (candidates.length === 0) return [];
 
+  const typeAffinity = historicTypeAffinity(team);
+
   const raw = candidates.map((p) => {
     const meta = metaCache[p.slug];
     const bst = meta?.bst ?? null;
@@ -682,7 +700,9 @@ function scoreCandidates(team, picksList) {
 
     const pace = 1 - Math.min(1, Math.abs(p.cost - targetPricePerSlot) / Math.max(targetPricePerSlot, p.cost, 1));
 
-    return { ...p, bst, value, patch, synergy, pace };
+    const hist = (typeAffinity[p.type1] || 0) + (typeAffinity[p.type2] || 0);
+
+    return { ...p, bst, value, patch, synergy, pace, hist };
   });
 
   const norm = (key) => {
@@ -691,13 +711,17 @@ function scoreCandidates(team, picksList) {
     const span = Math.max(...vals) - min || 1;
     return (v) => (v - min) / span;
   };
-  const nValue = norm("value"), nPatch = norm("patch"), nSynergy = norm("synergy"), nPace = norm("pace");
+  const nValue = norm("value"), nPatch = norm("patch"), nSynergy = norm("synergy"), nPace = norm("pace"), nHist = norm("hist");
 
   const scored = raw.map((r) => {
-    const score = 0.35 * nValue(r.value) + 0.35 * nPatch(r.patch) + 0.15 * nSynergy(r.synergy) + 0.15 * nPace(r.pace);
+    const score =
+      0.3 * nValue(r.value) + 0.3 * nPatch(r.patch) + 0.1 * nSynergy(r.synergy) + 0.1 * nPace(r.pace) + 0.2 * nHist(r.hist);
     let reason = "solid all-around pick";
     if (nPatch(r.patch) > 0.7) reason = "covers a type hole in your roster";
-    else if (nValue(r.value) > 0.7) reason = r.bst ? `great value — ${r.bst} BST for ${r.cost} pts` : `efficient at ${r.cost} pts`;
+    else if (r.hist > 0 && nHist(r.hist) > 0.7) {
+      const favType = (typeAffinity[r.type1] || 0) >= (typeAffinity[r.type2] || 0) ? r.type1 : r.type2;
+      reason = `${team} has favored ${favType}-type in past drafts`;
+    } else if (nValue(r.value) > 0.7) reason = r.bst ? `great value — ${r.bst} BST for ${r.cost} pts` : `efficient at ${r.cost} pts`;
     else if (nSynergy(r.synergy) > 0.7 && rosterTypes.size) reason = "classic type-core fit with your team";
     return { ...r, score, reason };
   });
@@ -753,7 +777,7 @@ function renderSuggestions() {
   }
 
   box.innerHTML = `
-    <div class="suggestions-head">💡 Suggested for ${team} — stats, typing &amp; team fit</div>
+    <div class="suggestions-head">💡 Suggested for ${team} — stats, typing, team fit &amp; history</div>
     <div class="suggestions-list">
       ${items
         .map(
@@ -792,18 +816,14 @@ function renderMockBar() {
   }
 
   if (!iAmLockedIn()) {
-    const takenByOthers = new Set(
-      Object.keys(mockControllers).filter((t) => mockControllers[t] && mockControllers[t] !== clientId)
-    );
     bar.innerHTML = `
       <div class="mock-setup">
-        <div class="mock-setup-head">🧪 Mock Draft Mode — practice against bots. ${mockStatus?.active ? "A session is already running — jump in on an open team." : "Pick your team to begin."}</div>
+        <div class="mock-setup-head">🧪 Mock Draft Mode — your own private practice run against bots. Pick your team to begin.</div>
         <div class="mock-setup-row">
           <select id="mockTeamSelect">
             <option value="">Choose your team…</option>
             ${TEAMS.map(
-              (t) =>
-                `<option value="${t.name}" ${t.name === mockMyTeam ? "selected" : ""} ${takenByOthers.has(t.name) ? "disabled" : ""}>${t.name}${takenByOthers.has(t.name) ? " (taken)" : ""}</option>`
+              (t) => `<option value="${t.name}" ${t.name === mockMyTeam ? "selected" : ""}>${t.name}</option>`
             ).join("")}
           </select>
           <button id="mockStartBtn" class="finalize-btn mock-start-btn">▶ Start Mock Draft</button>
@@ -818,13 +838,8 @@ function renderMockBar() {
         alert("Choose a team first.");
         return;
       }
-      const ok = await claimMockTeam(DRAFT_ROOM, mockMyTeam, clientId);
-      if (!ok) {
-        alert("That team was just claimed by another player — pick a different one.");
-        return;
-      }
       localStorage.setItem("draft_mock_team", mockMyTeam);
-      if (!mockStatus?.active) await startMockSession(DRAFT_ROOM);
+      await startMockSession(DRAFT_ROOM, clientId, mockMyTeam);
       renderAll();
       maybeScheduleBotMove();
     };
@@ -838,15 +853,15 @@ function renderMockBar() {
 
   bar.innerHTML = `
     <div class="mock-setup locked">
-      <span>🧪 Mock draft — locked in as <b>${mockMyTeam}</b>. Every other open team is bot-controlled.</span>
+      <span>🧪 Mock draft — locked in as <b>${mockMyTeam}</b>. Every other team is bot-controlled. This is your own private practice run — no one else can see or affect it.</span>
       <div class="mock-setup-row">
         <button id="mockResetBtn" class="danger-btn small">♻️ Restart mock draft</button>
         <button id="mockExitBtn" class="link-btn">Exit mock mode</button>
       </div>
     </div>`;
   el("mockResetBtn").onclick = () => {
-    if (!confirm("Restart the mock draft? This clears it for everyone currently practicing in this room.")) return;
-    resetMockDraft(DRAFT_ROOM);
+    if (!confirm("Restart your mock draft? This only clears your own practice session.")) return;
+    resetMockDraft(DRAFT_ROOM, clientId);
   };
   el("mockExitBtn").onclick = () => {
     mockMode = false;
@@ -867,12 +882,11 @@ function maybeScheduleBotMove() {
   if (!mockMode || !mockStatus?.active) return;
   const turn = currentTurnTeam(mockPicks);
   if (!turn) return; // mock draft complete
-  const isBot = !mockControllers[turn];
-  if (!isBot) return;
+  if (turn === mockMyTeam) return; // your turn, not a bot's
 
   mockBotTimer = setTimeout(() => {
     const pick = chooseBotPick(turn, mockPicks);
-    if (pick) submitMockPick(DRAFT_ROOM, DRAFT_ORDER, turn, pick.name, pick.cost);
+    if (pick) submitMockPick(DRAFT_ROOM, clientId, DRAFT_ORDER, turn, pick.name, pick.cost);
   }, 700 + Math.random() * 900);
 }
 
@@ -913,7 +927,7 @@ function draftPokemon(name) {
       alert(`${name} costs ${mon.cost} pts — you only have ${remaining} left.`);
       return;
     }
-    submitMockPick(DRAFT_ROOM, DRAFT_ORDER, mockMyTeam, mon.name, mon.cost);
+    submitMockPick(DRAFT_ROOM, clientId, DRAFT_ORDER, mockMyTeam, mon.name, mon.cost);
     return;
   }
 
@@ -970,18 +984,19 @@ function init() {
     history = flatPicks;
     renderAll();
   });
-  subscribeToMockPicks(DRAFT_ROOM, (list) => {
+  subscribeToMockPicks(DRAFT_ROOM, clientId, (list) => {
     mockPicks = list;
     renderAll();
     maybeScheduleBotMove();
   });
-  subscribeToMockControllers(DRAFT_ROOM, (ctrl) => {
-    mockControllers = ctrl;
-    renderAll();
-    maybeScheduleBotMove();
-  });
-  subscribeToMockStatus(DRAFT_ROOM, (status) => {
+  subscribeToMockStatus(DRAFT_ROOM, clientId, (status) => {
     mockStatus = status;
+    // Resume with the team this session was started as, e.g. after a
+    // reload — keeps the private session consistent with itself.
+    if (status?.team && status.team !== mockMyTeam) {
+      mockMyTeam = status.team;
+      localStorage.setItem("draft_mock_team", mockMyTeam);
+    }
     renderAll();
     maybeScheduleBotMove();
   });
