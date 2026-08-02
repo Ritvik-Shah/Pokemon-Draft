@@ -418,9 +418,10 @@ function renderFinalizeControl() {
 //     the same call already used for sprites, so no extra requests
 //  3) A small type-coverage bonus for rosters with more unique types,
 //     since narrow teams are easier to wall or sweep
-// Records are simulated across a round-robin schedule sized to NUM_ROUNDS
-// "weeks". If a mon's stats haven't loaded yet (or PokeAPI doesn't know a
-// Champions-exclusive form), that team quietly falls back toward a
+// Records come from a true single round-robin: every team plays every
+// other team exactly once, so a league of N teams gets a record out of
+// N-1 games. If a mon's stats haven't loaded yet (or PokeAPI doesn't know
+// a Champions-exclusive form), that team quietly falls back toward a
 // cost-only estimate until data arrives.
 
 function generateRoundRobinSchedule(teamNames, numWeeks) {
@@ -454,6 +455,54 @@ function generateRoundRobinSchedule(teamNames, numWeeks) {
 // power gaps translate into win odds.
 function winProbability(strengthA, strengthB, k = 20) {
   return 1 / (1 + Math.exp(-(strengthA - strengthB) / k));
+}
+
+// A tiny seeded PRNG (mulberry32) plus a string hash, so the playoff
+// bracket "simulates" real single-game outcomes (unlike the round-robin
+// record, which uses expected-value win probabilities) while still being
+// stable across re-renders of the same roster/stat data — it only
+// reshuffles when something about the standings actually changes, not
+// every time the page happens to re-render.
+function hashString(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6d2b79f5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Simulates one game as an actual random draw (not an expected value) —
+// that's what lets an underdog upset a higher seed in the bracket.
+function simulateGame(rng, teamA, teamB, strengthByTeam) {
+  const pA = winProbability(strengthByTeam[teamA.name], strengthByTeam[teamB.name]);
+  return rng() < pA ? teamA : teamB;
+}
+
+// Top-4-seed single-elimination bracket: #1 vs #4 and #2 vs #3 in the
+// semifinals, winners meet in the final. The champion is whoever wins
+// out the bracket, not necessarily the #1 regular-season seed — a lower
+// seed can absolutely upset its way to the title.
+function computePlayoffBracket(standings, strengthByTeam) {
+  if (standings.length < 4) return null;
+  const seeds = standings.slice(0, 4);
+  const rng = mulberry32(hashString(standings.map((r) => `${r.name}:${r.strength}`).join("|")));
+
+  const semiA = { teamA: seeds[0], teamB: seeds[3] };
+  const semiB = { teamA: seeds[1], teamB: seeds[2] };
+  semiA.winner = simulateGame(rng, semiA.teamA, semiA.teamB, strengthByTeam);
+  semiB.winner = simulateGame(rng, semiB.teamA, semiB.teamB, strengthByTeam);
+
+  const final = { teamA: semiA.winner, teamB: semiB.winner };
+  final.winner = simulateGame(rng, final.teamA, final.teamB, strengthByTeam);
+
+  return { seeds, semiA, semiB, final, champion: final.winner };
 }
 
 // Computes one team's power score plus the raw ingredients (for display).
@@ -491,7 +540,16 @@ function computePredictions(picksList = picks) {
   const teamNames = TEAMS.map((t) => t.name);
   const powerByTeam = Object.fromEntries(teamNames.map((n) => [n, computeTeamPower(n, picksList)]));
   const strengthByTeam = Object.fromEntries(teamNames.map((n) => [n, powerByTeam[n].power]));
-  const schedule = generateRoundRobinSchedule(teamNames, NUM_ROUNDS);
+
+  // A true single round-robin: every team plays every other team exactly
+  // once, so N teams get a record out of N-1 games. With an odd team
+  // count, generateRoundRobinSchedule needs N rounds (one bye round per
+  // team) to still seat every matchup exactly once — either way, no
+  // matchup repeats and every real game is counted exactly once.
+  const gamesPerTeam = teamNames.length - 1;
+  const hasByeWeek = teamNames.length % 2 !== 0;
+  const totalRounds = hasByeWeek ? teamNames.length : gamesPerTeam;
+  const schedule = generateRoundRobinSchedule(teamNames, totalRounds);
 
   const expectedWins = Object.fromEntries(teamNames.map((n) => [n, 0]));
   for (const week of schedule) {
@@ -504,7 +562,7 @@ function computePredictions(picksList = picks) {
 
   const maxStrength = Math.max(...teamNames.map((n) => strengthByTeam[n]), 1);
 
-  const results = teamNames.map((name) => {
+  const standings = teamNames.map((name) => {
     const p = powerByTeam[name];
     const xWins = expectedWins[name];
     const wins = Math.round(xWins);
@@ -517,13 +575,53 @@ function computePredictions(picksList = picks) {
       coverage: p.coverage,
       statsCoveragePct: p.statsCoveragePct,
       expectedWins: xWins,
-      record: `${wins}-${NUM_ROUNDS - wins}`,
+      record: `${wins}-${gamesPerTeam - wins}`,
     };
   });
 
-  results.sort((a, b) => b.expectedWins - a.expectedWins || b.strength - a.strength);
-  results.forEach((r, i) => (r.rank = i + 1));
-  return results;
+  standings.sort((a, b) => b.expectedWins - a.expectedWins || b.strength - a.strength);
+  standings.forEach((r, i) => (r.rank = i + 1));
+
+  const bracket = computePlayoffBracket(standings, strengthByTeam);
+  return { standings, bracket, gamesPerTeam };
+}
+
+function bracketTeamRow(team, winner) {
+  const isWinner = winner && winner.name === team.name;
+  return `
+    <div class="bracket-team ${isWinner ? "winner" : ""}">
+      <span class="bracket-seed">#${team.rank}</span>
+      <span class="bracket-name">${team.name}</span>
+      ${isWinner ? icon("check", "bracket-check") : ""}
+    </div>`;
+}
+function bracketMatchupHTML(m) {
+  return `
+    <div class="bracket-matchup">
+      ${bracketTeamRow(m.teamA, m.winner)}
+      ${bracketTeamRow(m.teamB, m.winner)}
+    </div>`;
+}
+function renderBracketHTML(bracket, mockMode) {
+  return `
+    <div class="champion-card">
+      <span class="crown">${ICON.trophy}</span>
+      <div>
+        <div class="champion-label">${mockMode ? "Mock Playoff Champion" : "Playoff Champion"}</div>
+        <div class="champion-name">${bracket.champion.name}</div>
+      </div>
+    </div>
+    <div class="bracket">
+      <div class="bracket-round">
+        <div class="bracket-round-label">Semifinals</div>
+        ${bracketMatchupHTML(bracket.semiA)}
+        ${bracketMatchupHTML(bracket.semiB)}
+      </div>
+      <div class="bracket-round">
+        <div class="bracket-round-label">Final</div>
+        ${bracketMatchupHTML(bracket.final)}
+      </div>
+    </div>`;
 }
 
 function renderPredictions() {
@@ -539,24 +637,17 @@ function renderPredictions() {
     return;
   }
 
-  const results = computePredictions(list);
-  const champ = results[0];
-  const stillLoading = results.some((r) => r.statsCoveragePct < 100);
+  const { standings, bracket, gamesPerTeam } = computePredictions(list);
+  const stillLoading = standings.some((r) => r.statsCoveragePct < 100);
   container.classList.add("show");
   container.innerHTML = `
     <div class="predictions-head">
       <div class="eyebrow">${mockMode ? "Mock Draft Projection" : "Season Projection"}</div>
-      <h2>${mockMode ? "Your Practice Draft — Standings &amp; Champion" : "Projected Standings &amp; Champion"}</h2>
-      <p>Strength blends draft cost spent, each roster's average base stat total (live from PokeAPI), and a small bonus for type coverage. Simulated across a ${NUM_ROUNDS}-week round-robin. For fun — not an official schedule.${mockMode ? " This is your own private practice run, not the real draft." : ""}</p>
+      <h2>${mockMode ? "Your Practice Draft — Standings &amp; Playoffs" : "Projected Standings &amp; Playoffs"}</h2>
+      <p>Strength blends draft cost spent, each roster's average base stat total (live from PokeAPI), and a small bonus for type coverage. Records come from a single round-robin — every team plays every other team once, for a record out of ${gamesPerTeam}. The top 4 then run a single-elimination bracket, simulated game by game, so the eventual champion isn't guaranteed to be the #1 seed. For fun — not an official schedule.${mockMode ? " This is your own private practice run, not the real draft." : ""}</p>
       ${stillLoading ? `<p class="stats-loading-note">Still pulling live base stats for some Pokémon — this refines automatically as they load.</p>` : ""}
     </div>
-    <div class="champion-card">
-      <span class="crown">${ICON.trophy}</span>
-      <div>
-        <div class="champion-label">${mockMode ? "Projected Mock Champion" : "Projected Champion"}</div>
-        <div class="champion-name">${champ.name}</div>
-      </div>
-    </div>
+    ${bracket ? renderBracketHTML(bracket, mockMode) : ""}
     <div class="predictions-table">
       <div class="pred-row pred-row-head">
         <span class="pred-rank"></span>
@@ -567,12 +658,12 @@ function renderPredictions() {
         <span class="pred-strength">Power</span>
         <span class="pred-record">Record</span>
       </div>
-      ${results
+      ${standings
         .map(
           (r) => `
-        <div class="pred-row ${r.rank === 1 ? "champ" : ""}">
+        <div class="pred-row ${r.rank <= 4 ? "seeded" : ""}">
           <span class="pred-rank">#${r.rank}</span>
-          <span class="pred-team">${r.name}</span>
+          <span class="pred-team">${r.name}${r.rank <= 4 ? `<span class="seed-tag">SEED ${r.rank}</span>` : ""}</span>
           <span class="pred-sub">${r.avgBST != null ? r.avgBST : "—"}</span>
           <span class="pred-sub">${r.coverage}</span>
           <div class="pred-bar"><div class="pred-bar-fill" style="width:${r.strengthPct}%"></div></div>
@@ -613,7 +704,7 @@ function csvEscape(val) {
 
 function exportDraftCSV(picksList = picks, isMock = false) {
   const byTeam = picksByTeam(picksList);
-  const predictions = computePredictions(picksList);
+  const { standings, bracket, gamesPerTeam } = computePredictions(picksList);
   const rows = [];
 
   rows.push(["Team Rosters"]);
@@ -627,11 +718,21 @@ function exportDraftCSV(picksList = picks, isMock = false) {
   }
 
   rows.push([]);
-  rows.push(["Projections"]);
-  rows.push(["Rank", "Team", "Power Score", "Draft Cost", "Avg Base Stat Total", "Type Coverage", "Projected Record", "Projected Champion"]);
-  predictions.forEach((r) => {
-    rows.push([r.rank, r.name, r.strength, r.cost, r.avgBST ?? "n/a", r.coverage, r.record, r.rank === 1 ? "Yes" : ""]);
+  rows.push([`Round-Robin Standings (record out of ${gamesPerTeam})`]);
+  rows.push(["Rank", "Team", "Power Score", "Draft Cost", "Avg Base Stat Total", "Type Coverage", "Record", "Playoff Seed"]);
+  standings.forEach((r) => {
+    rows.push([r.rank, r.name, r.strength, r.cost, r.avgBST ?? "n/a", r.coverage, r.record, r.rank <= 4 ? r.rank : ""]);
   });
+
+  if (bracket) {
+    rows.push([]);
+    rows.push(["Playoff Bracket"]);
+    rows.push(["Round", "Matchup", "Winner"]);
+    rows.push(["Semifinal", `#${bracket.semiA.teamA.rank} ${bracket.semiA.teamA.name} vs #${bracket.semiA.teamB.rank} ${bracket.semiA.teamB.name}`, bracket.semiA.winner.name]);
+    rows.push(["Semifinal", `#${bracket.semiB.teamA.rank} ${bracket.semiB.teamA.name} vs #${bracket.semiB.teamB.rank} ${bracket.semiB.teamB.name}`, bracket.semiB.winner.name]);
+    rows.push(["Final", `${bracket.final.teamA.name} vs ${bracket.final.teamB.name}`, bracket.final.winner.name]);
+    rows.push(["Champion", "", bracket.champion.name]);
+  }
 
   const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
