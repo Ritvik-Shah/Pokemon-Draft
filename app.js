@@ -155,6 +155,23 @@ function currentRound(list = picks) {
   return n < 0 ? 1 : Math.floor(n / TEAMS.length) + 1;
 }
 
+// The cheapest Pokémon anywhere in the pool — the minimum a team must be
+// able to reserve for each slot it still has left to fill.
+const MIN_MON_COST = Math.min(...POKEMON_LIST.map((p) => p.cost));
+
+// The most `team` can spend on its NEXT pick and still be able to afford
+// at least the cheapest mon for every slot after that one. Only the final
+// pick (no slots left afterward) is allowed to spend the whole remaining
+// budget — every earlier pick must leave >= MIN_MON_COST per slot left.
+function maxSpendableCost(team, picksList) {
+  const roster = picksByTeam(picksList)[team] || [];
+  const spent = costsByTeam(picksList)[team] || 0;
+  const budget = TEAM_BUDGETS[team] ?? 100;
+  const remaining = budget - spent;
+  const slotsLeftAfterThisPick = Math.max(0, NUM_ROUNDS - roster.length - 1);
+  return remaining - slotsLeftAfterThisPick * MIN_MON_COST;
+}
+
 // Which dataset/team/turn is "in play" right now — the real draft, or (if
 // mock mode is toggled on) the shared practice draft.
 function activeList() {
@@ -260,9 +277,7 @@ function renderPool() {
   const team = activeMyTeam();
   const taken = pickedNames(list);
   const turn = activeTurnTeam();
-  const spentByMe = costsByTeam(list)[team] || 0;
-  const myBudget = TEAM_BUDGETS[team] ?? 100;
-  const myRemaining = myBudget - spentByMe;
+  const myMaxSpendable = team ? maxSpendableCost(team, list) : 0;
   const canAct = mockMode ? !!(mockStatus?.active && iAmLockedIn()) : true;
 
   const filtered = POKEMON_LIST.filter((p) => {
@@ -275,11 +290,12 @@ function renderPool() {
 
   el("pool").innerHTML = filtered
     .map((p) => {
-      const canAfford = p.cost <= myRemaining;
+      const canAfford = p.cost <= myMaxSpendable;
       const isMyTurn = turn === team && team && canAct;
       const disabled = !isMyTurn || !canAfford;
+      const blockedBySlots = isMyTurn && !canAfford && p.cost <= (TEAM_BUDGETS[team] ?? 100) - (costsByTeam(list)[team] || 0);
       return `
-      <div class="pool-card ${disabled ? "disabled" : ""}" data-name="${p.name}">
+      <div class="pool-card ${disabled ? "disabled" : ""}" data-name="${p.name}" ${blockedBySlots ? `title="Picking this would leave too few points for your remaining roster slots."` : ""}>
         ${spriteBox(p, "sm")}
         <div class="pool-card-body">
           <div class="pool-card-top">
@@ -645,9 +661,6 @@ function historicTypeAffinity(team) {
 // other three signals — i.e. just the best options left on the list.
 function scoreCandidates(team, picksList) {
   const roster = picksByTeam(picksList)[team] || [];
-  const spent = costsByTeam(picksList)[team] || 0;
-  const budget = TEAM_BUDGETS[team] ?? 100;
-  const remaining = budget - spent;
   const taken = pickedNames(picksList);
 
   const rosterMons = roster.map((p) => POKEMON_LIST.find((m) => m.name === p.pokemon)).filter(Boolean);
@@ -669,9 +682,11 @@ function scoreCandidates(team, picksList) {
     weakness[atk] = w;
   }
 
-  // Cost only ever filters out what the team can't afford — it never
-  // factors into the ranking itself.
-  const candidates = POKEMON_LIST.filter((p) => !taken.has(p.name) && p.cost <= remaining);
+  // Cost only ever filters out what the team can't afford, or what would
+  // leave too little for its remaining roster slots — it never factors
+  // into the ranking itself.
+  const maxSpend = maxSpendableCost(team, picksList);
+  const candidates = POKEMON_LIST.filter((p) => !taken.has(p.name) && p.cost <= maxSpend);
   if (candidates.length === 0) return [];
 
   const typeAffinity = historicTypeAffinity(team);
@@ -737,8 +752,14 @@ function computeSuggestions(team, picksList = picks, limit = 4) {
 function chooseBotPick(team, picksList) {
   const scored = scoreCandidates(team, picksList);
   if (scored.length === 0) {
+    // Nothing satisfies the slot-reserve rule (should be rare — it means
+    // an earlier pick already ate into the reserve). Fall back to the
+    // cheapest mon the team can still actually afford, so the draft never
+    // stalls or goes over budget.
     const taken = pickedNames(picksList);
-    return POKEMON_LIST.filter((p) => !taken.has(p.name)).sort((a, b) => a.cost - b.cost)[0] || null;
+    const spent = costsByTeam(picksList)[team] || 0;
+    const remaining = (TEAM_BUDGETS[team] ?? 100) - spent;
+    return POKEMON_LIST.filter((p) => !taken.has(p.name) && p.cost <= remaining).sort((a, b) => a.cost - b.cost)[0] || null;
   }
   const pool = scored.slice(0, Math.min(5, scored.length));
   const weights = pool.map((p) => Math.max(0.05, p.score));
@@ -924,6 +945,11 @@ function draftPokemon(name) {
       alert(`${name} costs ${mon.cost} pts — you only have ${remaining} left.`);
       return;
     }
+    const maxSpend = maxSpendableCost(mockMyTeam, mockPicks);
+    if (mon.cost > maxSpend) {
+      alert(slotReserveMessage(name, mon, mockMyTeam, mockPicks, remaining));
+      return;
+    }
     submitMockPick(DRAFT_ROOM, clientId, DRAFT_ORDER, mockMyTeam, mon.name, mon.cost);
     return;
   }
@@ -940,8 +966,22 @@ function draftPokemon(name) {
     alert(`${name} costs ${mon.cost} pts — you only have ${remaining} left.`);
     return;
   }
+  const maxSpend = maxSpendableCost(myTeam, picks);
+  if (mon.cost > maxSpend) {
+    alert(slotReserveMessage(name, mon, myTeam, picks, remaining));
+    return;
+  }
   if (!confirm(`Draft ${name} for ${mon.cost} pts?`)) return;
   addPick({ team: myTeam, pokemon: mon.name, cost: mon.cost });
+}
+
+// Explains why a pick is blocked: it would leave fewer points than the
+// team's remaining (post-pick) roster slots require at MIN_MON_COST each.
+function slotReserveMessage(name, mon, team, picksList, remaining) {
+  const rosterLen = (picksByTeam(picksList)[team] || []).length;
+  const slotsLeftAfter = Math.max(0, NUM_ROUNDS - rosterLen - 1);
+  const leftover = remaining - mon.cost;
+  return `Drafting ${name} would leave ${team} with only ${leftover} pt${leftover === 1 ? "" : "s"} for ${slotsLeftAfter} remaining pick${slotsLeftAfter === 1 ? "" : "s"} — you need at least ${MIN_MON_COST} pt${MIN_MON_COST === 1 ? "" : "s"} per pick left. Choose something cheaper.`;
 }
 
 // ---------- Wire up ----------
