@@ -12,7 +12,32 @@ import {
   startMockSession,
   submitMockPick,
   resetMockDraft,
-} from "./firebase-sync.js";
+} from "./firebase-sync.js?v=1"; // bump alongside CACHE_BUST in index.html
+
+// ---------- Self-heal on a broken startup ----------
+// If something throws during module-level setup below (a corrupted
+// localStorage value, or any other unexpected startup error), the page
+// would otherwise be stuck forever on its empty HTML shell with nothing
+// visibly wrong to a non-technical user. As a last-resort safety net,
+// wipe this app's local storage once and reload automatically — the
+// one-shot sessionStorage guard prevents a genuine code bug from
+// looping reloads forever.
+window.addEventListener(
+  "error",
+  () => {
+    if (sessionStorage.getItem("draft_recovered_once")) return;
+    try {
+      sessionStorage.setItem("draft_recovered_once", "1");
+      Object.keys(localStorage)
+        .filter((k) => k.startsWith("draft_"))
+        .forEach((k) => localStorage.removeItem(k));
+    } catch {
+      // ignore — if storage itself is unusable there's nothing more to clear
+    }
+    location.reload();
+  },
+  { once: true }
+);
 
 const TYPE_COLORS = {
   Normal: "#A8A878", Fire: "#EE8130", Water: "#6390F0", Electric: "#F7D02C",

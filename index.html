@@ -4,7 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NSN Pokémon Draft — Live Draft Board</title>
-<link rel="stylesheet" href="style.css">
+<!-- CACHE_BUST: bump this ?v= number (here and on every script tag below,
+     plus the firebase-sync.js import in app.js) whenever app.js, style.css,
+     or firebase-sync.js changes. GitHub Pages caches these for 10 minutes
+     (cache-control: max-age=600) and browsers cache them independently on
+     top of that — without a version bump, a fresh push can silently keep
+     serving the previous copy for a while after deploying. -->
+<link rel="stylesheet" href="style.css?v=1">
 </head>
 <body>
 <div class="wrap">
@@ -48,8 +54,8 @@
   <footer>Click a Pokémon to draft it — only enabled when it's your team's turn and you can afford it.</footer>
 </div>
 
-<script src="config.js"></script>
-<script src="pokemon-data.js"></script>
-<script type="module" src="app.js"></script>
+<script src="config.js?v=1"></script>
+<script src="pokemon-data.js?v=1"></script>
+<script type="module" src="app.js?v=1"></script>
 </body>
 </html>
