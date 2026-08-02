@@ -19,9 +19,17 @@ import {
 // localStorage value, or any other unexpected startup error), the page
 // would otherwise be stuck forever on its empty HTML shell with nothing
 // visibly wrong to a non-technical user. As a last-resort safety net,
-// wipe this app's local storage once and reload automatically — the
-// one-shot sessionStorage guard prevents a genuine code bug from
+// wipe this app's local storage once and force a genuinely fresh load —
+// the one-shot sessionStorage guard prevents a real code bug from
 // looping reloads forever.
+//
+// A plain location.reload() isn't enough here: it respects the browser's
+// normal HTTP cache, so if the *page itself* (index.html) is what's
+// stale — not just app.js — reloading can just re-fetch the same cached
+// HTML pointing at the same broken/old script and hit the identical
+// error again. Navigating to a cache-busted URL (a query param the
+// browser has never seen) forces every layer of caching to be bypassed,
+// guaranteeing the next load is completely fresh.
 window.addEventListener(
   "error",
   () => {
@@ -34,7 +42,9 @@ window.addEventListener(
     } catch {
       // ignore — if storage itself is unusable there's nothing more to clear
     }
-    location.reload();
+    const url = new URL(location.href);
+    url.searchParams.set("_recover", Date.now().toString());
+    location.replace(url.toString());
   },
   { once: true }
 );
@@ -1289,9 +1299,15 @@ function maybeScheduleBotMove() {
   if (!turn) return; // mock draft complete
   if (turn === mockMyTeam) return; // your turn, not a bot's
 
-  mockBotTimer = setTimeout(() => {
+  mockBotTimer = setTimeout(async () => {
     const pick = chooseBotPick(turn, mockPicks);
-    if (pick) submitMockPick(DRAFT_ROOM, clientId, DRAFT_ORDER, turn, pick.name, pick.cost);
+    if (!pick) return;
+    const ok = await submitMockPick(DRAFT_ROOM, clientId, DRAFT_ORDER, turn, pick.name, pick.cost);
+    // A failed submission (e.g. a dropped connection) otherwise leaves
+    // the draft stuck forever — nothing else re-triggers this bot's turn
+    // since no new Firebase update ever arrives if the write never
+    // landed. Retry rather than silently giving up.
+    if (!ok) maybeScheduleBotMove();
   }, 700 + Math.random() * 900);
 }
 
