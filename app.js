@@ -79,7 +79,17 @@ function typeBadge(t) {
 // (for the strength model) — cached to localStorage so repeat visits and
 // prediction re-renders don't re-fetch up to 269 mons every time.
 const META_CACHE_KEY = "draft_mon_meta_cache_v2";
-const metaCache = JSON.parse(localStorage.getItem(META_CACHE_KEY) || "{}");
+// A corrupted cache (e.g. a browser crash mid-write) would otherwise throw
+// here and halt the entire script before init() ever runs, leaving the
+// page stuck on its empty HTML shell forever. Fall back to a fresh cache
+// and wipe the bad value instead of taking the whole app down with it.
+let metaCache;
+try {
+  metaCache = JSON.parse(localStorage.getItem(META_CACHE_KEY) || "{}");
+} catch {
+  metaCache = {};
+  localStorage.removeItem(META_CACHE_KEY);
+}
 
 function persistMetaCache() {
   localStorage.setItem(META_CACHE_KEY, JSON.stringify(metaCache));
