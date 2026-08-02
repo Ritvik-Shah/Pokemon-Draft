@@ -112,7 +112,7 @@ function hydrateSprites(container) {
     } else {
       img.closest(".sprite-box")?.classList.add("no-art");
     }
-    if (finalized) renderPredictions();
+    if (finalized || (mockMode && currentTurnTeam(mockPicks) === null)) renderPredictions();
   });
 }
 
@@ -392,8 +392,8 @@ function winProbability(strengthA, strengthB, k = 20) {
 }
 
 // Computes one team's power score plus the raw ingredients (for display).
-function computeTeamPower(teamName) {
-  const teamPicks = picksByTeam()[teamName] || [];
+function computeTeamPower(teamName, picksList = picks) {
+  const teamPicks = picksByTeam(picksList)[teamName] || [];
   const cost = teamPicks.reduce((sum, p) => sum + p.cost, 0);
 
   const bstValues = [];
@@ -422,9 +422,9 @@ function computeTeamPower(teamName) {
   return { power, cost, avgBST, coverage: types.size, statsCoveragePct };
 }
 
-function computePredictions() {
+function computePredictions(picksList = picks) {
   const teamNames = TEAMS.map((t) => t.name);
-  const powerByTeam = Object.fromEntries(teamNames.map((n) => [n, computeTeamPower(n)]));
+  const powerByTeam = Object.fromEntries(teamNames.map((n) => [n, computeTeamPower(n, picksList)]));
   const strengthByTeam = Object.fromEntries(teamNames.map((n) => [n, powerByTeam[n].power]));
   const schedule = generateRoundRobinSchedule(teamNames, NUM_ROUNDS);
 
@@ -465,33 +465,30 @@ function renderPredictions() {
   const container = el("predictions");
   if (!container) return;
 
-  if (mockMode) {
+  const list = mockMode ? mockPicks : picks;
+  const mockComplete = mockMode && !!mockStatus?.active && currentTurnTeam(list) === null;
+  const shouldShow = mockMode ? mockComplete : finalized;
+  if (!shouldShow) {
     container.classList.remove("show");
     container.innerHTML = "";
     return;
   }
 
-  if (!finalized) {
-    container.classList.remove("show");
-    container.innerHTML = "";
-    return;
-  }
-
-  const results = computePredictions();
+  const results = computePredictions(list);
   const champ = results[0];
   const stillLoading = results.some((r) => r.statsCoveragePct < 100);
   container.classList.add("show");
   container.innerHTML = `
     <div class="predictions-head">
-      <div class="eyebrow">Season Projection</div>
-      <h2>Projected Standings &amp; Champion</h2>
-      <p>Strength blends draft cost spent, each roster's average base stat total (live from PokeAPI), and a small bonus for type coverage. Simulated across a ${NUM_ROUNDS}-week round-robin. For fun — not an official schedule.</p>
+      <div class="eyebrow">${mockMode ? "Mock Draft Projection" : "Season Projection"}</div>
+      <h2>${mockMode ? "Your Practice Draft — Standings &amp; Champion" : "Projected Standings &amp; Champion"}</h2>
+      <p>Strength blends draft cost spent, each roster's average base stat total (live from PokeAPI), and a small bonus for type coverage. Simulated across a ${NUM_ROUNDS}-week round-robin. For fun — not an official schedule.${mockMode ? " This is your own private practice run, not the real draft." : ""}</p>
       ${stillLoading ? `<p class="stats-loading-note">🔄 Still pulling live base stats for some Pokémon — this refines automatically as they load.</p>` : ""}
     </div>
     <div class="champion-card">
       <span class="crown">👑</span>
       <div>
-        <div class="champion-label">Projected Champion</div>
+        <div class="champion-label">${mockMode ? "Projected Mock Champion" : "Projected Champion"}</div>
         <div class="champion-name">${champ.name}</div>
       </div>
     </div>
@@ -522,15 +519,24 @@ function renderPredictions() {
     </div>
     <div class="predictions-actions">
       <button id="exportCsvBtn" class="secondary-btn">⬇️ Export CSV</button>
-      <button id="resetDraftBtn" class="danger-btn">♻️ Reset &amp; start a new draft</button>
+      ${mockMode
+        ? `<button id="mockRestartBtn" class="danger-btn">♻️ Restart mock draft</button>`
+        : `<button id="resetDraftBtn" class="danger-btn">♻️ Reset &amp; start a new draft</button>`}
     </div>`;
 
-  el("exportCsvBtn").onclick = exportDraftCSV;
-  el("resetDraftBtn").onclick = () => {
-    if (!confirm("Reset the draft? Results are archived (so future pick suggestions still work), then the board clears for everyone so it can be drafted again.")) return;
-    if (!confirm("Really reset now? This clears every device viewing this room and can't be undone.")) return;
-    archiveAndClearDraft(DRAFT_ROOM);
-  };
+  el("exportCsvBtn").onclick = () => exportDraftCSV(list, mockMode);
+  if (mockMode) {
+    el("mockRestartBtn").onclick = () => {
+      if (!confirm("Restart your mock draft? This only clears your own practice session.")) return;
+      resetMockDraft(DRAFT_ROOM, clientId);
+    };
+  } else {
+    el("resetDraftBtn").onclick = () => {
+      if (!confirm("Reset the draft? Results are archived (so future pick suggestions still work), then the board clears for everyone so it can be drafted again.")) return;
+      if (!confirm("Really reset now? This clears every device viewing this room and can't be undone.")) return;
+      archiveAndClearDraft(DRAFT_ROOM);
+    };
+  }
 }
 
 // ---------- CSV export ----------
@@ -540,9 +546,9 @@ function csvEscape(val) {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-function exportDraftCSV() {
-  const byTeam = picksByTeam();
-  const predictions = computePredictions();
+function exportDraftCSV(picksList = picks, isMock = false) {
+  const byTeam = picksByTeam(picksList);
+  const predictions = computePredictions(picksList);
   const rows = [];
 
   rows.push(["Team Rosters"]);
@@ -568,7 +574,7 @@ function exportDraftCSV() {
   const stamp = new Date().toISOString().slice(0, 10);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `${DRAFT_ROOM}-results-${stamp}.csv`;
+  a.download = `${DRAFT_ROOM}-${isMock ? "mock-" : ""}results-${stamp}.csv`;
   document.body.appendChild(a);
   a.click();
   a.remove();
