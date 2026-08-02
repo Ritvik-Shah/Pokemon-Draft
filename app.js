@@ -120,30 +120,62 @@ function persistMetaCache() {
   localStorage.setItem(META_CACHE_KEY, JSON.stringify(metaCache));
 }
 
+// Every render re-scans its container for uncached sprites and fires a
+// fetch for each — on a cold cache, the pool alone can have ~269 uncached
+// cards, and renderAll() runs on every single pick. Without a cap, that's
+// hundreds of simultaneous requests repeated every second during an
+// active mock draft, which can bog a browser down badly enough to look
+// frozen. Route every meta fetch through a small concurrency-limited
+// queue instead of letting them all fire at once.
+const MAX_CONCURRENT_META_FETCHES = 6;
+let activeMetaFetches = 0;
+const metaFetchQueue = [];
+function pumpMetaFetchQueue() {
+  while (activeMetaFetches < MAX_CONCURRENT_META_FETCHES && metaFetchQueue.length) {
+    const job = metaFetchQueue.shift();
+    activeMetaFetches++;
+    job().finally(() => {
+      activeMetaFetches--;
+      pumpMetaFetchQueue();
+    });
+  }
+}
+function enqueueMetaFetch(job) {
+  return new Promise((resolve) => {
+    metaFetchQueue.push(() => job().then(resolve));
+    pumpMetaFetchQueue();
+  });
+}
+
 // Returns a Promise<{spriteUrl, bst}> — bst (base stat total) is null when
 // PokeAPI doesn't recognize the slug (e.g. a Champions-exclusive Mega/form).
 async function getPokemonMeta(slug) {
   if (slug in metaCache) return metaCache[slug];
-  try {
-    const res = await fetch(`https://pokeapi.co/api/v2/pokemon/${slug}`);
-    if (!res.ok) throw new Error("not found");
-    const data = await res.json();
-    const spriteUrl =
-      data?.sprites?.other?.["official-artwork"]?.front_default ||
-      data?.sprites?.front_default ||
-      null;
-    const statsArr = data?.stats || [];
-    const bst = statsArr.length ? statsArr.reduce((sum, s) => sum + (s.base_stat || 0), 0) : null;
-    const meta = { spriteUrl, bst };
-    metaCache[slug] = meta;
-    persistMetaCache();
-    return meta;
-  } catch {
-    const meta = { spriteUrl: null, bst: null };
-    metaCache[slug] = meta;
-    persistMetaCache();
-    return meta;
-  }
+  return enqueueMetaFetch(async () => {
+    // Re-check — another queued call for the same slug may have already
+    // resolved and cached it while this one was waiting its turn.
+    if (slug in metaCache) return metaCache[slug];
+    try {
+      const res = await fetch(`https://pokeapi.co/api/v2/pokemon/${slug}`);
+      if (!res.ok) throw new Error("not found");
+      const data = await res.json();
+      const spriteUrl =
+        data?.sprites?.other?.["official-artwork"]?.front_default ||
+        data?.sprites?.front_default ||
+        null;
+      const statsArr = data?.stats || [];
+      const bst = statsArr.length ? statsArr.reduce((sum, s) => sum + (s.base_stat || 0), 0) : null;
+      const meta = { spriteUrl, bst };
+      metaCache[slug] = meta;
+      persistMetaCache();
+      return meta;
+    } catch {
+      const meta = { spriteUrl: null, bst: null };
+      metaCache[slug] = meta;
+      persistMetaCache();
+      return meta;
+    }
+  });
 }
 
 // After cards are in the DOM, fill in every [data-slug] image lazily, and
