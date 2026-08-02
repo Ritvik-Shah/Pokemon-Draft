@@ -634,20 +634,20 @@ function historicTypeAffinity(team) {
 
 // Scores every affordable, undrafted Pokémon for `team` against the given
 // picks list, blending:
-//  - stat efficiency (BST per point spent, live from PokeAPI)
+//  - raw power (base stat total, live from PokeAPI)
 //  - type-weakness patching (does it cover a hole the roster already has)
 //  - classic type-core synergy (a stand-in for "real comps")
-//  - budget pacing (does the cost fit what's left to spend / slots left)
 //  - historic fit (has this team leaned on this type in past drafts here)
-// A team with no draft history in this room scores 0 on that last signal
+// Cost is only ever a hard affordability cutoff (see the `candidates`
+// filter below) — it doesn't push a pick up or down the ranking. A team
+// with no draft history in this room scores 0 on the historic-fit signal
 // for every candidate, so it has no effect and picks fall back to the
-// other four signals — i.e. just the best options left on the list.
+// other three signals — i.e. just the best options left on the list.
 function scoreCandidates(team, picksList) {
   const roster = picksByTeam(picksList)[team] || [];
   const spent = costsByTeam(picksList)[team] || 0;
   const budget = TEAM_BUDGETS[team] ?? 100;
   const remaining = budget - spent;
-  const slotsLeft = Math.max(1, NUM_ROUNDS - roster.length);
   const taken = pickedNames(picksList);
 
   const rosterMons = roster.map((p) => POKEMON_LIST.find((m) => m.name === p.pokemon)).filter(Boolean);
@@ -669,23 +669,17 @@ function scoreCandidates(team, picksList) {
     weakness[atk] = w;
   }
 
-  const targetPricePerSlot = remaining / slotsLeft;
+  // Cost only ever filters out what the team can't afford — it never
+  // factors into the ranking itself.
   const candidates = POKEMON_LIST.filter((p) => !taken.has(p.name) && p.cost <= remaining);
   if (candidates.length === 0) return [];
 
   const typeAffinity = historicTypeAffinity(team);
-  // The very first pick, with nothing to base a strategy on (empty roster,
-  // no past-draft tendencies for this team): BST-per-cost "value" ratio
-  // just surfaces the cheapest efficient mon, which isn't what "best
-  // available" means for a round-1 pick. Rank by raw power instead —
-  // the top overall Pokémon left, not the best bargain.
-  const firstPickNoHistory = roster.length === 0 && Object.keys(typeAffinity).length === 0;
 
   const raw = candidates.map((p) => {
     const meta = metaCache[p.slug];
     const bst = meta?.bst ?? null;
-    const power = bst ?? p.cost * 55; // sane fallback before stats load
-    const value = power / p.cost;
+    const power = bst ?? 400; // neutral placeholder before stats load — never cost-derived
 
     let patch = 0;
     for (const atk of ALL_TYPES) {
@@ -705,11 +699,9 @@ function scoreCandidates(team, picksList) {
     if (p.type1 && !rosterTypes.has(p.type1)) synergy += 0.3;
     if (p.type2 && !rosterTypes.has(p.type2)) synergy += 0.3;
 
-    const pace = 1 - Math.min(1, Math.abs(p.cost - targetPricePerSlot) / Math.max(targetPricePerSlot, p.cost, 1));
-
     const hist = (typeAffinity[p.type1] || 0) + (typeAffinity[p.type2] || 0);
 
-    return { ...p, bst, power, value, patch, synergy, pace, hist };
+    return { ...p, bst, power, patch, synergy, hist };
   });
 
   const norm = (key) => {
@@ -718,27 +710,16 @@ function scoreCandidates(team, picksList) {
     const span = Math.max(...vals) - min || 1;
     return (v) => (v - min) / span;
   };
-  const nValue = norm("value"), nPatch = norm("patch"), nSynergy = norm("synergy"), nPace = norm("pace"), nHist = norm("hist");
-  const nPower = norm("power"), nCost = norm("cost");
+  const nPower = norm("power"), nPatch = norm("patch"), nSynergy = norm("synergy"), nHist = norm("hist");
 
   const scored = raw.map((r) => {
-    let score, reason;
-    if (firstPickNoHistory) {
-      // Best overall talent left, tie-broken by cost since a higher price
-      // usually reflects a stronger mon when stats haven't loaded yet.
-      score = 0.85 * nPower(r.power) + 0.15 * nCost(r.cost);
-      reason = r.bst ? `top overall pick — ${r.bst} BST` : `top pick — highest cost available`;
-    } else {
-      score =
-        0.3 * nValue(r.value) + 0.3 * nPatch(r.patch) + 0.1 * nSynergy(r.synergy) + 0.1 * nPace(r.pace) + 0.2 * nHist(r.hist);
-      reason = "solid all-around pick";
-      if (nPatch(r.patch) > 0.7) reason = "covers a type hole in your roster";
-      else if (r.hist > 0 && nHist(r.hist) > 0.7) {
-        const favType = (typeAffinity[r.type1] || 0) >= (typeAffinity[r.type2] || 0) ? r.type1 : r.type2;
-        reason = `${team} has favored ${favType}-type in past drafts`;
-      } else if (nValue(r.value) > 0.7) reason = r.bst ? `great value — ${r.bst} BST for ${r.cost} pts` : `efficient at ${r.cost} pts`;
-      else if (nSynergy(r.synergy) > 0.7 && rosterTypes.size) reason = "classic type-core fit with your team";
-    }
+    const score = 0.35 * nPower(r.power) + 0.35 * nPatch(r.patch) + 0.15 * nSynergy(r.synergy) + 0.15 * nHist(r.hist);
+    let reason = r.bst ? `strong stats — ${r.bst} BST` : "solid all-around pick";
+    if (nPatch(r.patch) > 0.7) reason = "covers a type hole in your roster";
+    else if (r.hist > 0 && nHist(r.hist) > 0.7) {
+      const favType = (typeAffinity[r.type1] || 0) >= (typeAffinity[r.type2] || 0) ? r.type1 : r.type2;
+      reason = `${team} has favored ${favType}-type in past drafts`;
+    } else if (nSynergy(r.synergy) > 0.7 && rosterTypes.size) reason = "classic type-core fit with your team";
     return { ...r, score, reason };
   });
 
