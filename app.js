@@ -188,13 +188,34 @@ async function getPokemonMeta(slug) {
   });
 }
 
+// Coalesces bursts of "a stat just streamed in" signals into a single
+// predictions re-render instead of one per resolved sprite.
+let refreshPredictionsTimer = null;
+function scheduleRefreshPredictions() {
+  if (refreshPredictionsTimer) return;
+  refreshPredictionsTimer = setTimeout(() => {
+    refreshPredictionsTimer = null;
+    renderPredictions();
+  }, 150);
+}
+
 // After cards are in the DOM, fill in every [data-slug] image lazily, and
 // nudge the predictions panel to redraw with sharper data as base stats
 // stream in (a no-op if the draft isn't finalized yet).
-function hydrateSprites(container) {
+//
+// Pass { silent: true } when hydrating content that predictions itself
+// just rendered (its own MVP sprites) — without it, each of those images
+// resolving would trigger another full renderPredictions() call, which
+// creates a fresh batch of its own images, which each trigger yet
+// another render... an unbounded, self-amplifying loop that pegs the
+// main thread solid once a draft completes. Only genuinely new data (a
+// cache miss) schedules a refresh at all; a cache hit changes nothing
+// worth re-rendering for.
+function hydrateSprites(container, { silent = false } = {}) {
   const imgs = container.querySelectorAll("img[data-slug]");
   imgs.forEach(async (img) => {
     const slug = img.dataset.slug;
+    const wasCached = slug in metaCache;
     const meta = await getPokemonMeta(slug);
     if (meta.spriteUrl) {
       img.src = meta.spriteUrl;
@@ -202,7 +223,9 @@ function hydrateSprites(container) {
     } else {
       img.closest(".sprite-box")?.classList.add("no-art");
     }
-    if (finalized || (mockMode && currentTurnTeam(mockPicks) === null)) renderPredictions();
+    if (!silent && !wasCached && (finalized || (mockMode && currentTurnTeam(mockPicks) === null))) {
+      scheduleRefreshPredictions();
+    }
   });
 }
 
@@ -899,7 +922,7 @@ function renderPredictions() {
         ? `<button id="mockRestartBtn" class="danger-btn">${icon("restart")}Restart mock draft</button>`
         : `<button id="resetDraftBtn" class="danger-btn">${icon("restart")}Reset &amp; start a new draft</button>`}
     </div>`;
-  hydrateSprites(container);
+  hydrateSprites(container, { silent: true });
 
   el("exportCsvBtn").onclick = () => exportDraftCSV(list, mockMode);
   if (mockMode) {
