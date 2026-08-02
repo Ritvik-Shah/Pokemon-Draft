@@ -4,13 +4,42 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NSN Pokémon Draft — Live Draft Board</title>
-<!-- CACHE_BUST: bump this ?v= number (here and on every script tag below,
-     plus the firebase-sync.js import in app.js) whenever app.js, style.css,
-     or firebase-sync.js changes. GitHub Pages caches these for 10 minutes
-     (cache-control: max-age=600) and browsers cache them independently on
-     top of that — without a version bump, a fresh push can silently keep
-     serving the previous copy for a while after deploying. -->
+<!-- CACHE_BUST: whenever app.js, style.css, or firebase-sync.js changes,
+     bump the version in ALL THREE of these places together:
+       1. The ?v= query string on every script/link tag below
+       2. The <meta name="app-version"> tag just below
+       3. version.json at the repo root
+     GitHub Pages caches every file — including this HTML — for 10
+     minutes (cache-control: max-age=600), and browsers cache
+     independently on top of that. A normal reload can be served
+     entirely from local cache with zero network request during that
+     window, so a fresh push can silently stay invisible for a while.
+     The inline script below checks version.json (fetched with
+     cache-busting so it always reaches the real server) on every load
+     and force-refreshes if this page turns out to be stale. -->
+<meta name="app-version" content="1">
 <link rel="stylesheet" href="style.css?v=1">
+<script>
+// Runs before anything else. Even a stale cached copy of this very page
+// keeps running this same check (it doesn't need to change between
+// deploys), so once it's live, staleness gets caught within about a
+// second of loading instead of only after something visibly breaks.
+(function () {
+  var CURRENT_VERSION = document.querySelector('meta[name="app-version"]').content;
+  fetch("version.json?_=" + Date.now(), { cache: "no-store" })
+    .then(function (res) { return res.ok ? res.json() : null; })
+    .then(function (data) {
+      if (!data || data.version === CURRENT_VERSION) return;
+      var url = new URL(location.href);
+      url.searchParams.set("_recover", Date.now().toString());
+      location.replace(url.toString());
+    })
+    .catch(function () {
+      // A network hiccup here shouldn't block the page from loading —
+      // worst case this particular load just doesn't get to self-check.
+    });
+})();
+</script>
 </head>
 <body>
 <div class="wrap">
